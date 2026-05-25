@@ -3,16 +3,15 @@ import json
 import time
 import re
 import requests
-from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-from urllib.parse import urljoin
+from bs4 import BeautifulSoup
 
 # ─── Config ──────────────────────────────────────────────
 TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SEEN_FILE = "seen.json"
-BASE    = "https://www.rbi.org.in"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RBI-Bot/1.0)"}
+RSS_URL  = "https://www.rbi.org.in/rss.xml"
+HEADERS  = {"User-Agent": "Mozilla/5.0 (compatible; RBI-Bot/1.0)"}
 
 # ─── Exam priority keywords ──────────────────────────────
 EXAM_KEYWORDS = [
@@ -27,28 +26,23 @@ EXAM_KEYWORDS = [
     "ombudsman", "consumer protection", "dpt", "deposit insurance",
 ]
 
-# ─── Sources to scrape ───────────────────────────────────
-SOURCES = [
-    {
-        "label": "📢 Press Release",
-        "url": f"{BASE}/Scripts/BS_PressReleaseDisplay.aspx",
-        "tag": "press"
-    },
-    {
-        "label": "📋 Circular",
-        "url": f"{BASE}/Scripts/BS_CircularIndexDisplay.aspx",
-        "tag": "circular"
-    },
-    {
-        "label": "🔔 Notification",
-        "url": f"{BASE}/Scripts/Notifications.aspx",
-        "tag": "notification"
-    },
-    {
-        "label": "🌐 What's New",
-        "url": f"{BASE}/Scripts/Whatsnewindisplay.aspx",
-        "tag": "whatsnew"
-    },
+# ─── Entity extraction patterns ──────────────────────────
+ENTITY_PATTERNS = [
+    (r"all\s+scheduled\s+commercial\s+banks", "All Scheduled Commercial Banks"),
+    (r"all\s+banks", "All Banks"),
+    (r"urban\s+co-operative\s+banks?", "Urban Co-operative Banks"),
+    (r"state\s+co-operative\s+banks?", "State Co-operative Banks"),
+    (r"primary\s*\(\s*urban\s*\)\s*co-operative\s+banks?", "Primary (Urban) Co-operative Banks"),
+    (r"non-banking\s+financial\s+companies?", "NBFCs"),
+    (r"nbfcs?", "NBFCs"),
+    (r"payment\s+system\s+operators?", "Payment System Operators"),
+    (r"payment\s+banks?", "Payment Banks"),
+    (r"small\s+finance\s+banks?", "Small Finance Banks"),
+    (r"regional\s+rural\s+banks?", "Regional Rural Banks"),
+    (r"asset\s+reconstruction\s+companies?", "Asset Reconstruction Companies"),
+    (r"housing\s+finance\s+companies?", "Housing Finance Companies"),
+    (r"co-operative\s+banks?", "Co-operative Banks"),
+    (r"scheduled\s+banks", "Scheduled Banks"),
 ]
 
 # ─── Helpers ─────────────────────────────────────────────
@@ -57,194 +51,99 @@ def load_seen():
         with open(SEEN_FILE) as f:
             return json.load(f)
     except Exception:
-        return {}
+        return {"press": [], "circular": [], "notification": [], "whatsnew": []}
 
 def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
         json.dump(seen, f, indent=2)
 
-def extract_date(text):
-    """
-    Try to find a date anywhere in a cell using common patterns.
-    Returns a datetime object or None.
-    """
-    # Look for pattern like 'May 25, 2026' or '25 May 2026'
-    match = re.search(r'(\d{1,2}\s+\w+\s+\d{4})', text)
-    if match:
-        return parse_date(match.group(1))
-    return None
-
-def parse_date(text):
-    """Parse a clean date string."""
-    text = text.strip().replace(",", "")
-    formats = ["%B %d %Y", "%d %B %Y", "%b %d %Y", "%d %b %Y"]
-    for fmt in formats:
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-    return None
-
-def is_exam_relevant(title):
-    """Return True if the title contains any exam keyword (case-insensitive)."""
-    title_lower = title.lower()
-    return any(kw in title_lower for kw in EXAM_KEYWORDS)
-
-def _clean_summary(text):
-    """
-    Remove the RBI metadata line that looks like:
-    'Press Releases ( 472 kb ) Date : May 25, 2026'
-    Also removes any leading/trailing whitespace.
-    """
-    # Strip leading/trailing spaces/newlines
-    text = text.strip()
-    # Pattern: file type, size, and date line at the very start
-    # It may contain extra spaces, so use \s+ generously.
-    pattern = r'^[A-Za-z\s]+\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s+\d{4}\s*'
-    cleaned = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
-    # If nothing left (unlikely), return the original trimmed text
-    return cleaned[:300] + ("…" if len(cleaned) > 300 else "")
-
-def fetch_summary(url):
-    """
-    Scrape the detail page and return the first 300 characters of the
-    main article text, without the RBI navigation header or metadata line.
-    """
+def parse_rss_date(text):
+    """Parse RSS pubDate like 'Mon, 25 May 2026 12:34:56 +0530'."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # Check if we landed on an error page
-        page_text = soup.get_text()
-        if "sorry for your inconvenience" in page_text.lower():
-            return ""
-
-        # Remove irrelevant elements
-        for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
-            tag.decompose()
-
-        # Strategy 1: Common content containers
-        content = soup.select_one(
-            "#content, .content, .main-content, .entry-content, .pressrelease, "
-            "article, [role='main'], .page-content, .post-content"
-        )
-        if content:
-            text = content.get_text(separator=" ", strip=True)
-            text = " ".join(text.split())
-            if len(text) > 150:
-                return _clean_summary(text)
-
-        # Strategy 2: Column with most text
-        cols = soup.select('div[class*="col-"]')
-        if cols:
-            best = max(cols, key=lambda c: len(c.get_text()))
-            text = best.get_text(separator=" ", strip=True)
-            text = " ".join(text.split())
-            if len(text) > 150:
-                return _clean_summary(text)
-
-        # Strategy 3: Fallback body text filtering
-        body_text = soup.body.get_text(separator="\n") if soup.body else ""
-        lines = [line.strip() for line in body_text.splitlines() if line.strip()]
-        skip_keywords = [
-            "skip to main content", "search the website", "home", "about us",
-            "organisation & functions", "organisation structure", "departments",
-            "offices", "training establishment", "college of agricultural banking",
-            "reserve bank staff college", "site map", "accessibility", "screen reader",
-            "go to navigation", "go to content"
-        ]
-        clean_lines = []
-        for line in lines:
-            lower = line.lower()
-            if any(kw in lower for kw in skip_keywords):
-                continue
-            if len(line) < 20:
-                continue
-            clean_lines.append(line)
-
-        cleaned_text = " ".join(clean_lines)
-        cleaned_text = " ".join(cleaned_text.split())
-        if cleaned_text:
-            return _clean_summary(cleaned_text)
-
-        return ""
-
+        # Remove day name and timezone offset
+        clean = re.sub(r'^[A-Za-z]{3},\s*', '', text)
+        clean = re.sub(r'\s*\+\d{4}$', '', clean)
+        return datetime.strptime(clean, "%d %b %Y %H:%M:%S")
     except Exception:
-        return ""
+        return None
 
-def scrape_with_dates(source):
-    """Return list of {date, title, url} for top items on a page."""
+def extract_entities(text):
+    """Find which banks/entities are mentioned in the description."""
+    text_lower = text.lower()
+    found = []
+    for pattern, label in ENTITY_PATTERNS:
+        if re.search(pattern, text_lower):
+            if label not in found:
+                found.append(label)
+    return found
+
+def fetch_rss():
+    """Return a list of dicts: {title, link, pubDate, description, category, tag} from RSS."""
     try:
-        r = requests.get(source["url"], headers=HEADERS, timeout=20)
+        r = requests.get(RSS_URL, headers=HEADERS, timeout=20)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(r.content, "xml")
         items = []
+        for entry in soup.find_all("item"):
+            title = entry.find("title").get_text(strip=True)
+            link = entry.find("link").get_text(strip=True)
+            pub = entry.find("pubDate")
+            pub_date = parse_rss_date(pub.get_text(strip=True)) if pub else None
+            desc = entry.find("description")
+            description = desc.get_text(strip=True) if desc else ""
+            # Clean CDATA / HTML
+            description = BeautifulSoup(description, "html.parser").get_text(separator=" ", strip=True)
+            category_tag = entry.find("category")
+            cat = category_tag.get_text(strip=True).lower() if category_tag else ""
 
-        for row in soup.select("table tr"):
-            cells = row.find_all("td")
-            if len(cells) < 2:
-                continue
-            # Use the new extract_date on the entire cell text
-            date_cell = cells[0].get_text(" ", strip=True)
-            dt = extract_date(date_cell)
-            a_tag = row.find("a", href=True)
-            if not a_tag:
-                continue
-            href = a_tag.get("href", "").strip()
-            title = a_tag.get_text(" ", strip=True)
-            if not title or len(title) < 8:
-                continue
-            if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
-                continue
-
-            abs_url = urljoin(source["url"], href)
+            # Map category to our tags
+            if "press release" in cat:
+                tag = "press"
+                label = "📢 Press Release"
+            elif "circular" in cat:
+                tag = "circular"
+                label = "📋 Circular"
+            elif "notification" in cat:
+                tag = "notification"
+                label = "🔔 Notification"
+            elif "what's new" in cat or "whatsnew" in cat:
+                tag = "whatsnew"
+                label = "🌐 What's New"
+            else:
+                # Fallback by link URL
+                if "/BS_PressReleaseDisplay.aspx" in link:
+                    tag = "press"
+                    label = "📢 Press Release"
+                elif "/BS_CircularIndexDisplay.aspx" in link:
+                    tag = "circular"
+                    label = "📋 Circular"
+                elif "/Notifications.aspx" in link:
+                    tag = "notification"
+                    label = "🔔 Notification"
+                else:
+                    tag = "whatsnew"
+                    label = "🌐 What's New"
 
             items.append({
-                "date": dt,
                 "title": title,
-                "url": abs_url
+                "link": link,
+                "pub_date": pub_date,
+                "description": description,
+                "category": label,
+                "tag": tag
             })
-            if len(items) >= 20:
-                break
-
-        # If no dates found, fall back: return items without dates (date=None)
-        if not any(item["date"] for item in items):
-            plain_items = scrape(source)
-            return [{"date": None, "title": t, "url": u} for t, u in plain_items]
-
         return items
     except Exception as e:
-        print(f"  ⚠️  Error scraping {source['label']}: {e}")
-        return []
-
-def scrape(source):
-    """Fallback scraper that returns list of (title, url)."""
-    try:
-        r = requests.get(source["url"], headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        items = []
-        for a in soup.select("table a[href]"):
-            href  = a.get("href", "").strip()
-            title = a.get_text(" ", strip=True)
-            if not title or len(title) < 8:
-                continue
-            if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
-                continue
-
-            abs_url = urljoin(source["url"], href)
-            items.append((title, abs_url))
-            if len(items) >= 15:
-                break
-        return items
-    except Exception as e:
-        print(f"  ⚠️  Error scraping {source['label']}: {e}")
+        print(f"⚠️ Error fetching RSS: {e}")
         return []
 
 def send(text):
-    """Send a Telegram message."""
+    """Send a Telegram message, splitting if needed."""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    # Telegram max length 4096, but keep it shorter for readability
+    MAX_LEN = 4000
+    if len(text) > MAX_LEN:
+        text = text[:MAX_LEN-3] + "…"
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
@@ -255,135 +154,120 @@ def send(text):
         r = requests.post(url, json=payload, timeout=15)
         r.raise_for_status()
     except Exception as e:
-        print(f"  ⚠️  Telegram error: {e}")
-
-# ─── Monthly summary builder ─────────────────────────────
-def get_monthly_summary():
-    cutoff = datetime.now() - timedelta(days=30)
-    all_items = []
-
-    for source in SOURCES:
-        items = scrape_with_dates(source)
-        for item in items:
-            if item["date"] is None or item["date"] >= cutoff:
-                all_items.append({**item, "tag": source["tag"], "label": source["label"]})
-
-    seen_urls = set()
-    unique = []
-    for item in all_items:
-        if item["url"] not in seen_urls:
-            seen_urls.add(item["url"])
-            unique.append(item)
-
-    unique.sort(key=lambda x: (x["date"] is not None, x["date"] or datetime.min), reverse=True)
-
-    if not unique:
-        return None
-
-    counts = {}
-    for item in unique:
-        counts[item["label"]] = counts.get(item["label"], 0) + 1
-
-    today = datetime.now().strftime("%d %b %Y")
-    cutoff_str = cutoff.strftime("%d %b")
-    lines = [
-        f"📊 <b>RBI Monthly Roundup (last 30 days)</b>",
-        f"━━━━━━━━━━━━━━━━━━━━━",
-        f"📆 Period: {cutoff_str} – {today}",
-        f"📌 Total updates: {len(unique)}",
-        "",
-    ]
-    for label, count in counts.items():
-        lines.append(f"{label}: {count} item(s)")
-    lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("🔹 <b>Recent highlights:</b>")
-
-    for item in unique[:10]:
-        date_str = item["date"].strftime("%d %b") if item["date"] else "?"
-        title_short = item["title"][:120]
-        summary = fetch_summary(item["url"])
-        block = f"• {item['label']} ({date_str})\n  <b>{title_short}</b>"
-        if summary:
-            block += f"\n  <i>{summary[:250]}</i>"
-        block += f"\n  <a href='{item['url']}'>📄 Read full update</a>"
-        lines.append(block)
-
-    if len(unique) > 10:
-        lines.append(f"… and {len(unique) - 10} more")
-
-    lines.append("")
-    lines.append(f"🔗 <a href='https://www.rbi.org.in'>Visit rbi.org.in</a>")
-
-    return "\n".join(lines)
+        print(f"⚠️ Telegram error: {e}")
 
 # ─── Main ────────────────────────────────────────────────
 def main():
     seen = load_seen()
-    new_items = []
     today_str = datetime.now().strftime("%d %b %Y")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetching RBI RSS feed...")
+    items = fetch_rss()
+    if not items:
+        send(f"🏦 <b>RBI Bot — {today_str}</b>\n⚠️ Could not fetch updates today. The bot will retry tomorrow.")
+        return
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting RBI scrape...")
-
-    for source in SOURCES:
-        tag   = source["tag"]
-        label = source["label"]
-        print(f"  Scraping: {label}")
-
+    # Filter new items (not in seen)
+    new_items = []
+    for item in items:
+        tag = item["tag"]
         if tag not in seen:
             seen[tag] = []
+        if item["link"] not in seen[tag]:
+            seen[tag].append(item["link"])
+            new_items.append(item)
 
-        items = scrape_with_dates(source)
-        for item in items:
-            url = item["url"]
-            if url not in seen[tag]:
-                seen[tag].append(url)
-                new_items.append({
-                    "label": label,
-                    "title": item["title"],
-                    "url": url,
-                    "exam": is_exam_relevant(item["title"])
-                })
-
+    # ── Daily updates if something new ──────────────────
     if new_items:
         send(
             f"🏦 <b>RBI Update — {today_str}</b>\n"
-            f"{'─' * 28}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"Found <b>{len(new_items)}</b> new item(s) today!\n"
-            f"🔗 <a href='https://www.rbi.org.in'>rbi.org.in</a>\n"
+            f"🔗 <a href='https://www.rbi.org.in'>rbi.org.in</a>"
         )
-        for i, item in enumerate(new_items):
-            title = item["title"][:200]
-            prefix = "⭐ EXAM-RELEVANT: " if item["exam"] else ""
-            summary = ""
-            if i < 10:
-                summary = fetch_summary(item["url"])
-                time.sleep(0.5)
-
-            msg = f"{item['label']}\n{prefix}<b>{title}</b>"
-            if summary:
-                msg += f"\n<i>{summary[:250]}</i>"
-            msg += f"\n<a href='{item['url']}'>📄 Read full update</a>"
-            send(msg)
-        print(f"  ✅ Sent {len(new_items)} new items to Telegram.")
-    else:
-        monthly_msg = get_monthly_summary()
-        if monthly_msg:
-            msg = f"🏦 <b>RBI Bot — {today_str}</b>\n✅ No new updates today.\n\n" + monthly_msg
-            send(msg)
-            print("  ✅ No new items. Monthly summary sent.")
-        else:
-            send(
-                f"🏦 <b>RBI Bot — {today_str}</b>\n"
-                f"{'─' * 28}\n"
-                f"✅ No new updates from RBI today.\n"
-                f"No updates in the last 30 days either.\n"
-                f"Your bot is alive and watching! 👀"
+        for item in new_items:
+            title = item["title"]
+            # Clean description: remove title if repeated, limit to 300 chars
+            desc = item["description"]
+            if desc.startswith(title):
+                desc = desc[len(title):].strip()
+            # Build a crisp summary (first 250 chars)
+            summary = desc[:250] + ("…" if len(desc) > 250 else "")
+            # Exam relevance
+            is_exam = any(kw in title.lower() for kw in EXAM_KEYWORDS)
+            prefix = "⭐ <b>EXAM-RELEVANT</b>\n" if is_exam else ""
+            # Entities affected
+            entities = extract_entities(desc)
+            affected = f"\n🎯 <b>Affected:</b> {', '.join(entities)}" if entities else ""
+            # Date string
+            date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "?"
+            # Final message
+            msg = (
+                f"{item['category']} ({date_str})\n"
+                f"{prefix}"
+                f"<b>{title}</b>\n"
+                f"<i>{summary}</i>"
+                f"{affected}\n"
+                f"<a href='{item['link']}'>📄 Read full update</a>"
             )
-            print("  ✅ No updates at all. Heartbeat sent.")
+            send(msg)
+        print(f"✅ Sent {len(new_items)} new items.")
+    else:
+        # ── Monthly roundup if nothing new ───────────────
+        cutoff = datetime.now() - timedelta(days=30)
+        monthly = [it for it in items if it["pub_date"] and it["pub_date"] >= cutoff]
+        # Deduplicate by link
+        unique = {}
+        for it in monthly:
+            if it["link"] not in unique:
+                unique[it["link"]] = it
+        monthly = list(unique.values())
+        monthly.sort(key=lambda x: x["pub_date"], reverse=True)
+
+        if not monthly:
+            send(f"🏦 <b>RBI Bot — {today_str}</b>\n✅ No new updates today. No updates in the last 30 days.\nBot is alive! 👀")
+            save_seen(seen)
+            return
+
+        # Count categories
+        counts = {}
+        for it in monthly:
+            counts[it["category"]] = counts.get(it["category"], 0) + 1
+        lines = [
+            f"📊 <b>RBI Monthly Roundup (last 30 days)</b>",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"📆 Period: {cutoff.strftime('%d %b')} – {today_str}",
+            f"📌 Total updates: {len(monthly)}",
+            "",
+        ]
+        for cat, cnt in counts.items():
+            lines.append(f"{cat}: {cnt} item(s)")
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🔹 <b>Recent highlights:</b>")
+        # Show top 10
+        for item in monthly[:10]:
+            date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "?"
+            desc = item["description"]
+            if desc.startswith(item["title"]):
+                desc = desc[len(item["title"]):].strip()
+            summary = desc[:200] + ("…" if len(desc) > 200 else "")
+            entities = extract_entities(desc)
+            affected = f" | Affected: {', '.join(entities)}" if entities else ""
+            lines.append(
+                f"• {item['category']} ({date_str})\n"
+                f"  <b>{item['title']}</b>\n"
+                f"  <i>{summary}</i>{affected}\n"
+                f"  <a href='{item['link']}'>📄 Read more</a>"
+            )
+        if len(monthly) > 10:
+            lines.append(f"… and {len(monthly) - 10} more")
+        lines.append("")
+        lines.append("🔗 <a href='https://www.rbi.org.in'>rbi.org.in</a>")
+        msg = f"🏦 <b>RBI Bot — {today_str}</b>\n✅ No new updates today.\n\n" + "\n".join(lines)
+        send(msg)
+        print("✅ No new items. Monthly summary sent.")
 
     save_seen(seen)
-    print("  💾 seen.json updated.")
 
 if __name__ == "__main__":
     main()
