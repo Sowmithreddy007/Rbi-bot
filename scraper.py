@@ -98,22 +98,16 @@ def send(text):
     except Exception as e:
         print(f"⚠️ Telegram error: {e}")
 
-def parse_date_from_cell(text):
-    match = re.search(r'(\d{1,2}\s+\w+\s+\d{4})', text)
+def parse_date_from_cell(cell_text):
+    # cell_text might contain extra whitespace/newlines; look for a date pattern
+    match = re.search(r'(\d{1,2}\s+\w+\s+\d{4})', cell_text)
     if match:
-        try:
-            return parse_date_string(match.group(1))
-        except:
-            pass
-    return None
-
-def parse_date_string(text):
-    text = text.strip().replace(",", "")
-    for fmt in ["%B %d %Y", "%d %B %Y", "%b %d %Y", "%d %b %Y"]:
-        try:
-            return datetime.strptime(text, fmt)
-        except:
-            continue
+        date_str = match.group(1)
+        for fmt in ["%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y"]:
+            try:
+                return datetime.strptime(date_str, fmt)
+            except:
+                continue
     return None
 
 def scrape_page(source):
@@ -126,6 +120,7 @@ def scrape_page(source):
             cells = row.find_all("td")
             if len(cells) < 2:
                 continue
+            # Get the full text content of the first cell
             cell_text = cells[0].get_text(" ", strip=True)
             dt = parse_date_from_cell(cell_text)
             a_tag = row.find("a", href=True)
@@ -141,20 +136,7 @@ def scrape_page(source):
             items.append({"date": dt, "title": title, "url": abs_url})
             if len(items) >= 20:
                 break
-        if not any(item["date"] for item in items):
-            simple_items = []
-            for a in soup.select("table a[href]"):
-                href = a.get("href", "").strip()
-                title = a.get_text(" ", strip=True)
-                if not title or len(title) < 8:
-                    continue
-                if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
-                    continue
-                abs_url = urljoin(source["url"], href)
-                simple_items.append({"date": None, "title": title, "url": abs_url})
-                if len(simple_items) >= 15:
-                    break
-            return simple_items
+        # If we got any items, return them; if none, return empty
         return items
     except Exception as e:
         print(f"⚠️ Error scraping {source['label']}: {e}")
@@ -193,39 +175,37 @@ def fetch_summary_from_url(url):
         print(f"⚠️ Error fetching summary from {url}: {e}")
         return ""
 
-# ─── Main ────────────────────────────────────────────────
 def main():
     seen = load_seen()
     today_str = datetime.now().strftime("%d %b %Y")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Scraping RBI website...")
 
-    # Build items from scraping
     all_items = []
     for src in SOURCES:
-        page_items = scrape_page(src)
-        print(f"[DEBUG] Scraped {len(page_items)} items from {src['label']}")
-        for it in page_items:
+        items = scrape_page(src)
+        print(f"[DEBUG] Scraped {len(items)} items from {src['label']}")
+        for it in items:
             it["tag"] = src["tag"]
             it["category"] = src["label"]
-        all_items.extend(page_items)
+        all_items.extend(items)
 
+    # Convert to unified format
     items = []
     for it in all_items:
-        pub = it.get("date")
         items.append({
             "title": it["title"],
             "link": it["url"],
-            "pub_date": pub,
-            "description": "",   # will fetch summary later
+            "pub_date": it["date"],
+            "description": "",
             "category": it["category"],
             "tag": it["tag"]
         })
 
     if not items:
-        send(f"🏦 <b>RBI Bot — {today_str}</b>\n⚠️ Could not fetch updates today. The bot will retry tomorrow.")
+        send(f"🏦 <b>RBI Bot — {today_str}</b>\n⚠️ Could not fetch updates today.")
         return
 
-    # Filter new items (not seen before)
+    # Identify new items (not in seen.json)
     new_items = []
     for item in items:
         tag = item["tag"]
@@ -251,11 +231,8 @@ def main():
         for idx, item in enumerate(new_items):
             try:
                 title = item["title"]
-                # Fetch summary only for first 10 to avoid rate limiting
-                if idx < 10:
-                    desc = fetch_summary_from_url(item["link"])
-                else:
-                    desc = ""
+                # Only fetch summary for first 10 to stay within time
+                desc = fetch_summary_from_url(item["link"]) if idx < 10 else ""
                 summary = clean_summary(desc, title) if desc else ""
                 is_exam = any(kw in title.lower() for kw in EXAM_KEYWORDS)
                 prefix = "⭐ <b>EXAM-RELEVANT</b>\n" if is_exam else ""
@@ -276,15 +253,23 @@ def main():
                 traceback.print_exc()
         print(f"✅ Sent {len(new_items)} new items.")
     else:
-        # Monthly roundup
+        # Monthly roundup (include items even if no date)
         cutoff = datetime.now() - timedelta(days=30)
-        monthly = [it for it in items if it["pub_date"] and it["pub_date"] >= cutoff]
+        monthly = []
+        for it in items:
+            if it["pub_date"] is None:
+                # No date? Assume it's recent (top of the listing)
+                monthly.append(it)
+            elif it["pub_date"] >= cutoff:
+                monthly.append(it)
+
+        # Deduplicate
         unique = {}
         for it in monthly:
             if it["link"] not in unique:
                 unique[it["link"]] = it
         monthly = list(unique.values())
-        monthly.sort(key=lambda x: x["pub_date"], reverse=True)
+        monthly.sort(key=lambda x: (x["pub_date"] is not None, x["pub_date"] or datetime.min), reverse=True)
 
         if not monthly:
             send(f"🏦 <b>RBI Bot — {today_str}</b>\n✅ No new updates today. No updates in the last 30 days.\nBot is alive! 👀")
