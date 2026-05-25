@@ -6,11 +6,12 @@ import requests
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-from sumy.parsers.html import HtmlParser
+from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
 from sumy.nlp.stemmers import Stemmer
 from sumy.utils import get_stop_words
+from sumy.nlp.stemmers import Stemmer
 
 # ─── Config ──────────────────────────────────────────────
 TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -57,7 +58,7 @@ ENTITY_PATTERNS = [
 ]
 
 LANGUAGE = "english"
-SENTENCES_COUNT = 2
+SENTENCES_COUNT = 3   # slightly longer summary now that we have clean text
 
 # ─── Helpers ─────────────────────────────────────────────
 def load_seen():
@@ -82,55 +83,89 @@ def extract_entities(text):
                 found.append(label)
     return found
 
-def clean_text(text):
-    """Remove any RBI metadata line and repeated titles from the start."""
-    # Remove lines like: "Press Releases ( 153 kb ) Date : May 22, 2026"
-    # Also handles cases where only "( 153 kb ) Date : ..." remains
+def clean_text(text, title=""):
+    """
+    Aggressively remove any RBI metadata line and repeated titles.
+    """
+    # Remove lines like "Press Releases ( 153 kb ) Date : May 22, 2026" or just "( 153 kb ) Date : May 22, 2026"
     text = re.sub(
         r"^(?:[A-Za-z\s]+)?\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s*,?\s*\d{4}\s*",
         "", text, flags=re.IGNORECASE).strip()
-    # Remove leading "Press Release" alone
+    # Remove any standalone "Press Release" at the beginning
     text = re.sub(r"^(Press Releases?)\s*", "", text, flags=re.IGNORECASE).strip()
+    # If title appears again at the start (after cleaning), remove it
+    if title and text.lower().startswith(title.lower()):
+        text = text[len(title):].strip()
     return text
 
-def generate_summary(url, title=""):
-    """Return a clean 2‑sentence summary or a fallback snippet."""
-    # Try AI summary via sumy
-    try:
-        parser = HtmlParser.from_url(url, Tokenizer(LANGUAGE))
-        stemmer = Stemmer(LANGUAGE)
-        summarizer = LsaSummarizer(stemmer)
-        summarizer.stop_words = get_stop_words(LANGUAGE)
-        sentences = summarizer(parser.document, SENTENCES_COUNT)
-        summary = " ".join(str(s) for s in parser.document.sentences if s in sentences)
-        summary = re.sub(r'\s+', ' ', summary).strip()
-        summary = clean_text(summary)
-        if summary.lower().startswith(title.lower()):
-            summary = summary[len(title):].strip()
-        if summary:
-            return summary[:500]
-    except Exception as e:
-        print(f"⚠️ Sumy failed, using fallback: {e}")
-
-    # Fallback: scrape first 300 chars of article text
+def extract_article_content(url):
+    """
+    Fetch the article page, extract the main body text without navigation,
+    and return cleaned text.
+    """
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
+        # Remove irrelevant tags
         for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
             tag.decompose()
+        # Try to get main content area
         content = soup.select_one("#content, article, [role='main'], .pressrelease")
         if not content:
             content = soup
+        # Extract text and normalize spaces
         text = content.get_text(separator=" ", strip=True)
         text = re.sub(r'\s+', ' ', text).strip()
-        text = clean_text(text)
-        if text.lower().startswith(title.lower()):
-            text = text[len(title):].strip()
-        return text[:300] + ("…" if len(text) > 300 else "")
+        return text
     except Exception as e:
-        print(f"⚠️ Fallback summary also failed: {e}")
+        print(f"⚠️ Could not extract article content: {e}")
         return ""
+
+def generate_summary(url, title=""):
+    """
+    Generate a true summary of the full article content.
+    Uses sumy on cleaned full text; falls back to a smart first-two-sentences extract.
+    """
+    # Fetch and clean the full article
+    full_text = extract_article_content(url)
+    if not full_text:
+        return ""
+
+    # Remove any remaining metadata line from the full text
+    cleaned_full = clean_text(full_text, title)
+
+    # Try AI summary via sumy using the cleaned plain text
+    try:
+        parser = PlaintextParser.from_string(cleaned_full, Tokenizer(LANGUAGE))
+        stemmer = Stemmer(LANGUAGE)
+        summarizer = LsaSummarizer(stemmer)
+        summarizer.stop_words = get_stop_words(LANGUAGE)
+        sentences = summarizer(parser.document, SENTENCES_COUNT)
+        # Keep the original order
+        ordered = [str(s) for s in parser.document.sentences if s in sentences]
+        summary = " ".join(ordered)
+        summary = re.sub(r'\s+', ' ', summary).strip()
+        # Final cleaning in case sumy picked up any leftover junk
+        summary = clean_text(summary, title)
+        if summary:
+            return summary[:600]
+    except Exception as e:
+        print(f"⚠️ Sumy summarization failed, using fallback: {e}")
+
+    # Fallback: grab the first two non‑trivial sentences from the cleaned text
+    sentences = re.split(r'(?<=[.!?])\s+', cleaned_full)
+    meaningful = []
+    for sent in sentences:
+        s = sent.strip()
+        # Skip very short sentences and those still containing metadata markers
+        if len(s) < 30 or re.search(r'\(\s*\d+\s*kb\s*\)', s):
+            continue
+        meaningful.append(s)
+        if len(meaningful) >= 2:
+            break
+    fallback = " ".join(meaningful)
+    return fallback[:500] if fallback else cleaned_full[:300]
 
 def send(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -150,18 +185,19 @@ def send(text):
         print(f"⚠️ Telegram error: {e}")
 
 def find_date_in_row(row):
-    """Look through all cells of a row for a date (with or without comma), return datetime or None."""
-    # Pattern matches: "May 25, 2026", "25 May 2026", "May 25 2026" etc.
+    """
+    Scan all cells in a row for a date. Returns a datetime or None.
+    """
     date_regex = re.compile(r'(\d{1,2}\s+\w+\s*,?\s*\d{4})')
     for cell in row.find_all(["td", "th"]):
         text = cell.get_text(" ", strip=True)
         match = date_regex.search(text)
         if match:
-            date_str = match.group(1).replace(",", "")  # remove comma
+            date_str = match.group(1).replace(",", "")
             for fmt in ("%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y"):
                 try:
                     return datetime.strptime(date_str, fmt)
-                except:
+                except ValueError:
                     continue
     return None
 
@@ -244,20 +280,22 @@ def main():
         for idx, item in enumerate(new_items):
             try:
                 title = item["title"]
-                summary = generate_summary(item["link"], title) if idx < 10 else ""
+                # Generate summary using full article content (for all items now, not just first 10)
+                summary = generate_summary(item["link"], title)
                 is_exam = any(kw in title.lower() for kw in EXAM_KEYWORDS)
                 prefix = "⭐ <b>EXAM-RELEVANT</b>\n" if is_exam else ""
-                # Use summary, fallback to title for entity extraction
                 entities = extract_entities(summary) if summary else extract_entities(title)
                 affected = f"\n🎯 <b>Affected:</b> {', '.join(entities)}" if entities else ""
-                date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "?"
+                date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "Recent"
                 msg = (
                     f"{item['category']} ({date_str})\n"
                     f"{prefix}"
                     f"<b>{title}</b>"
                 )
                 if summary:
-                    msg += f"\n📌 <i>{summary}</i>"
+                    summary_display = clean_text(summary, title)   # final safety
+                    if summary_display:
+                        msg += f"\n📌 <i>{summary_display}</i>"
                 msg += f"{affected}\n<a href='{item['link']}'>📄 Read full update</a>"
                 send(msg)
             except Exception as e:
@@ -265,6 +303,7 @@ def main():
                 traceback.print_exc()
         print(f"✅ Sent {len(new_items)} new items.")
     else:
+        # Monthly roundup
         cutoff = datetime.now() - timedelta(days=30)
         monthly = []
         for it in items:
@@ -297,14 +336,15 @@ def main():
             lines.append("🔹 <b>Recent highlights:</b>")
             for item in monthly[:10]:
                 try:
-                    date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "?"
+                    date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "Recent"
                     summary = generate_summary(item["link"], item["title"])
-                    entities = extract_entities(summary) if summary else extract_entities(item["title"])
+                    summary_display = clean_text(summary, item["title"]) if summary else ""
+                    entities = extract_entities(summary_display) if summary_display else extract_entities(item["title"])
                     affected = f" | Affected: {', '.join(entities)}" if entities else ""
                     lines.append(
                         f"• {item['category']} ({date_str})\n"
                         f"  <b>{item['title']}</b>\n"
-                        f"  📌 <i>{summary}</i>{affected}\n"
+                        f"  📌 <i>{summary_display}</i>{affected}\n"
                         f"  <a href='{item['link']}'>📄 Read more</a>"
                     )
                 except Exception as e:
