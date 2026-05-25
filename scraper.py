@@ -11,7 +11,6 @@ from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
 from sumy.nlp.stemmers import Stemmer
 from sumy.utils import get_stop_words
-from sumy.nlp.stemmers import Stemmer
 
 # ─── Config ──────────────────────────────────────────────
 TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -58,7 +57,7 @@ ENTITY_PATTERNS = [
 ]
 
 LANGUAGE = "english"
-SENTENCES_COUNT = 3   # slightly longer summary now that we have clean text
+SENTENCES_COUNT = 3
 
 # ─── Helpers ─────────────────────────────────────────────
 def load_seen():
@@ -83,40 +82,56 @@ def extract_entities(text):
                 found.append(label)
     return found
 
-def clean_text(text, title=""):
+def deep_clean_text(text, title=""):
     """
-    Aggressively remove any RBI metadata line and repeated titles.
+    Aggressively clean any RBI boilerplate, navigation, footers,
+    metadata lines, and repeated titles.
     """
-    # Remove lines like "Press Releases ( 153 kb ) Date : May 22, 2026" or just "( 153 kb ) Date : May 22, 2026"
+    # 1. Remove metadata line like "Press Releases ( 153 kb ) Date : May 22, 2026"
     text = re.sub(
-        r"^(?:[A-Za-z\s]+)?\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s*,?\s*\d{4}\s*",
-        "", text, flags=re.IGNORECASE).strip()
-    # Remove any standalone "Press Release" at the beginning
-    text = re.sub(r"^(Press Releases?)\s*", "", text, flags=re.IGNORECASE).strip()
-    # If title appears again at the start (after cleaning), remove it
+        r"\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s*,?\s*\d{4}\s*",
+        "", text, flags=re.IGNORECASE)
+    # 2. Remove leading "Press Releases" or "Circulars" etc.
+    text = re.sub(r"^(Press Releases?|Circulars?|Notifications?|What's New)\s*", "", text, flags=re.IGNORECASE).strip()
+    # 3. Remove navigation boilerplate lines (case-insensitive)
+    nav_keywords = [
+        "skip to main content", "search the website", "home", "notifications index",
+        "to rbi circulars index", "site map", "screen reader", "go to navigation",
+        "go to content", "about us", "organisation", "functions", "departments"
+    ]
+    for kw in nav_keywords:
+        text = re.sub(rf"\b{re.escape(kw)}\b", "", text, flags=re.IGNORECASE)
+    # 4. Remove month/year selection lines
+    text = re.sub(r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b", "", text)
+    text = re.sub(r"\b\d{4}\s+All\s+Months\b", "", text)
+    # 5. Remove signature blocks and sign-off lines
+    signature_keywords = ["yours sincerely", "chief general manager", "principal chief general manager"]
+    for kw in signature_keywords:
+        text = re.sub(rf"\b{re.escape(kw)}\b[^.]*\.?", "", text, flags=re.IGNORECASE)
+    # 6. Collapse multiple spaces and strip
+    text = re.sub(r'\s+', ' ', text).strip()
+    # 7. If title appears at start, remove it
     if title and text.lower().startswith(title.lower()):
         text = text[len(title):].strip()
     return text
 
 def extract_article_content(url):
-    """
-    Fetch the article page, extract the main body text without navigation,
-    and return cleaned text.
-    """
+    """Fetch the full article page, clean out navigation/footer, return text."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        # Remove irrelevant tags
-        for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
+        # Remove script, style, nav, header, footer, noscript
+        for tag in soup(["script", "style", "nav", "header", "footer", "noscript", "aside", "form"]):
             tag.decompose()
-        # Try to get main content area
-        content = soup.select_one("#content, article, [role='main'], .pressrelease")
+        # Try to get the main content area
+        content = soup.select_one("#content, article, [role='main'], .pressrelease, .main-content")
         if not content:
-            content = soup
-        # Extract text and normalize spaces
+            content = soup.body or soup
         text = content.get_text(separator=" ", strip=True)
         text = re.sub(r'\s+', ' ', text).strip()
+        # Apply deep cleaning to remove remaining boilerplate
+        text = deep_clean_text(text)
         return text
     except Exception as e:
         print(f"⚠️ Could not extract article content: {e}")
@@ -124,48 +139,42 @@ def extract_article_content(url):
 
 def generate_summary(url, title=""):
     """
-    Generate a true summary of the full article content.
-    Uses sumy on cleaned full text; falls back to a smart first-two-sentences extract.
+    Generate a concise summary from the full cleaned article.
+    Uses sumy LSA summarizer; falls back to first 2 meaningful sentences.
     """
-    # Fetch and clean the full article
     full_text = extract_article_content(url)
     if not full_text:
         return ""
 
-    # Remove any remaining metadata line from the full text
-    cleaned_full = clean_text(full_text, title)
-
-    # Try AI summary via sumy using the cleaned plain text
+    # Try sumy on plain text
     try:
-        parser = PlaintextParser.from_string(cleaned_full, Tokenizer(LANGUAGE))
+        parser = PlaintextParser.from_string(full_text, Tokenizer(LANGUAGE))
         stemmer = Stemmer(LANGUAGE)
         summarizer = LsaSummarizer(stemmer)
         summarizer.stop_words = get_stop_words(LANGUAGE)
         sentences = summarizer(parser.document, SENTENCES_COUNT)
-        # Keep the original order
         ordered = [str(s) for s in parser.document.sentences if s in sentences]
         summary = " ".join(ordered)
         summary = re.sub(r'\s+', ' ', summary).strip()
-        # Final cleaning in case sumy picked up any leftover junk
-        summary = clean_text(summary, title)
+        # Final deep clean to catch any leftover
+        summary = deep_clean_text(summary, title)
         if summary:
             return summary[:600]
     except Exception as e:
         print(f"⚠️ Sumy summarization failed, using fallback: {e}")
 
-    # Fallback: grab the first two non‑trivial sentences from the cleaned text
-    sentences = re.split(r'(?<=[.!?])\s+', cleaned_full)
+    # Fallback: pick first two meaningful sentences
+    sentences = re.split(r'(?<=[.!?])\s+', full_text)
     meaningful = []
     for sent in sentences:
         s = sent.strip()
-        # Skip very short sentences and those still containing metadata markers
         if len(s) < 30 or re.search(r'\(\s*\d+\s*kb\s*\)', s):
             continue
         meaningful.append(s)
         if len(meaningful) >= 2:
             break
     fallback = " ".join(meaningful)
-    return fallback[:500] if fallback else cleaned_full[:300]
+    return fallback[:500] if fallback else full_text[:300]
 
 def send(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -185,9 +194,6 @@ def send(text):
         print(f"⚠️ Telegram error: {e}")
 
 def find_date_in_row(row):
-    """
-    Scan all cells in a row for a date. Returns a datetime or None.
-    """
     date_regex = re.compile(r'(\d{1,2}\s+\w+\s*,?\s*\d{4})')
     for cell in row.find_all(["td", "th"]):
         text = cell.get_text(" ", strip=True)
@@ -280,7 +286,6 @@ def main():
         for idx, item in enumerate(new_items):
             try:
                 title = item["title"]
-                # Generate summary using full article content (for all items now, not just first 10)
                 summary = generate_summary(item["link"], title)
                 is_exam = any(kw in title.lower() for kw in EXAM_KEYWORDS)
                 prefix = "⭐ <b>EXAM-RELEVANT</b>\n" if is_exam else ""
@@ -293,9 +298,10 @@ def main():
                     f"<b>{title}</b>"
                 )
                 if summary:
-                    summary_display = clean_text(summary, title)   # final safety
-                    if summary_display:
-                        msg += f"\n📌 <i>{summary_display}</i>"
+                    # Final safety clean
+                    clean_display = deep_clean_text(summary, title)
+                    if clean_display:
+                        msg += f"\n📌 <i>{clean_display}</i>"
                 msg += f"{affected}\n<a href='{item['link']}'>📄 Read full update</a>"
                 send(msg)
             except Exception as e:
@@ -338,13 +344,13 @@ def main():
                 try:
                     date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "Recent"
                     summary = generate_summary(item["link"], item["title"])
-                    summary_display = clean_text(summary, item["title"]) if summary else ""
-                    entities = extract_entities(summary_display) if summary_display else extract_entities(item["title"])
+                    clean_display = deep_clean_text(summary, item["title"]) if summary else ""
+                    entities = extract_entities(clean_display) if clean_display else extract_entities(item["title"])
                     affected = f" | Affected: {', '.join(entities)}" if entities else ""
                     lines.append(
                         f"• {item['category']} ({date_str})\n"
                         f"  <b>{item['title']}</b>\n"
-                        f"  📌 <i>{summary_display}</i>{affected}\n"
+                        f"  📌 <i>{clean_display}</i>{affected}\n"
                         f"  <a href='{item['link']}'>📄 Read more</a>"
                     )
                 except Exception as e:
