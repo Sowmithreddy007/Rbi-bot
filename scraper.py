@@ -1,7 +1,6 @@
 import os
 import json
 import re
-import traceback
 import requests
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
@@ -74,111 +73,72 @@ def extract_entities(text):
                 found.append(label)
     return found
 
-def clean_text(text, title=""):
-    """Remove RBI boilerplate, metadata, and repeated titles."""
-    # Remove metadata line like "Press Releases ( 153 kb ) Date : May 22, 2026"
-    text = re.sub(
-        r"^(?:[A-Za-z\s]+)?\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s*,?\s*\d{4}\s*",
-        "", text, flags=re.IGNORECASE).strip()
-    # Remove leading "Press Release" etc.
-    text = re.sub(r"^(Press Releases?|Circulars?|Notifications?|What's New)\s*", "", text, flags=re.IGNORECASE).strip()
-    # Navigation junk
-    nav = ["skip to main content", "search the website", "home", "notifications index",
-           "to rbi circulars index", "site map", "screen reader", "go to navigation",
-           "go to content", "about us", "organisation", "functions", "departments"]
-    for kw in nav:
-        text = re.sub(rf"\b{re.escape(kw)}\b", "", text, flags=re.IGNORECASE)
-    # Month/year selection blocks
-    text = re.sub(r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b", "", text)
-    text = re.sub(r"\b\d{4}\s+All\s+Months\b", "", text)
-    # Signature lines
-    sig = ["yours sincerely", "chief general manager", "principal chief general manager"]
-    for kw in sig:
-        text = re.sub(rf"\b{re.escape(kw)}\b[^.]*\.?", "", text, flags=re.IGNORECASE)
-    # Normalise spaces
-    text = re.sub(r'\s+', ' ', text).strip()
-    if title and text.lower().startswith(title.lower()):
-        text = text[len(title):].strip()
-    return text
-
-def extract_date_from_page(url):
-    """
-    Try to find a date on the article page itself.
-    Returns a datetime or None.
-    """
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        # Remove scripts, styles
-        for tag in soup(["script", "style"]):
-            tag.decompose()
-        # Look for a "Date : ..." pattern
-        text = soup.get_text(" ", strip=True)
-        match = re.search(r'Date\s*:\s*(\d{1,2}\s+\w+\s*,?\s*\d{4})', text)
-        if match:
-            date_str = match.group(1).replace(",", "")
-            for fmt in ("%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y"):
-                try:
-                    return datetime.strptime(date_str, fmt)
-                except:
-                    continue
-    except:
-        pass
+def parse_date(text):
+    """Parse a date string with multiple formats."""
+    text = text.replace(",", "").strip()
+    for fmt in ("%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y"):
+        try:
+            return datetime.strptime(text, fmt)
+        except:
+            continue
     return None
 
-def generate_summary_and_date(url, title=""):
+def fetch_detail(url):
     """
-    Fetches the full article, cleans it, extracts a summary (first 2 meaningful sentences)
-    and also tries to extract the publication date from the page.
-    Returns (summary, date_or_None).
+    Fetch the detail page and return (date, summary_text).
     """
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # ---- date extraction from page ----
+        # --- Extract date ---
         page_date = None
-        # Find date in meta line
-        text = soup.get_text(" ", strip=True)
-        m = re.search(r'Date\s*:\s*(\d{1,2}\s+\w+\s*,?\s*\d{4})', text)
-        if m:
-            ds = m.group(1).replace(",", "")
-            for fmt in ("%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y"):
-                try:
-                    page_date = datetime.strptime(ds, fmt)
-                    break
-                except:
-                    continue
+        # Look for "Date : 25 May 2026" pattern
+        date_match = re.search(r'Date\s*:\s*(\d{1,2}\s+\w+\s*,?\s*\d{4})', soup.get_text())
+        if date_match:
+            page_date = parse_date(date_match.group(1))
 
-        # ---- summary extraction ----
-        for tag in soup(["script", "style", "nav", "header", "footer", "noscript", "aside", "form"]):
+        # --- Extract summary (first 2 meaningful sentences) ---
+        # Remove nav, scripts, etc.
+        for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
             tag.decompose()
-        content = soup.select_one("#content, article, [role='main'], .pressrelease, .main-content")
+
+        # Get main content
+        content = soup.select_one("#content, article, [role='main'], .pressrelease")
         if not content:
             content = soup.body or soup
         text = content.get_text(separator=" ", strip=True)
         text = re.sub(r'\s+', ' ', text).strip()
-        text = clean_text(text, title)
 
-        # Pick first 2 meaningful sentences
+        # Clean boilerplate
+        # Remove metadata line "Press Releases ( 153 kb ) Date : May 22, 2026"
+        text = re.sub(r"Press Releases?\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s*,?\s*\d{4}\s*", "", text)
+        # Remove other similar lines
+        text = re.sub(r"Circulars?\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s*,?\s*\d{4}\s*", "", text)
+        # Normalise
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        # Split into sentences
         sentences = re.split(r'(?<=[.!?])\s+', text)
         meaningful = []
         for s in sentences:
             s = s.strip()
+            # skip short, metadata or navigation
             if len(s) < 30 or re.search(r'\(\s*\d+\s*kb\s*\)', s):
                 continue
             meaningful.append(s)
             if len(meaningful) >= 2:
                 break
+
         summary = " ".join(meaningful)
         if not summary:
             summary = text[:300] + ("…" if len(text) > 300 else "")
-        return summary[:500], page_date
+
+        return page_date, summary[:500]
     except Exception as e:
-        print(f"⚠️ Failed to process page {url}: {e}")
-        return "", None
+        print(f"⚠️ Detail error for {url}: {e}")
+        return None, ""
 
 def send(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -197,7 +157,7 @@ def send(text):
     except Exception as e:
         print(f"⚠️ Telegram error: {e}")
 
-# ─── Scraper (only data source) ──────────────────────────
+# ─── Scrape listing pages ───────────────────────────────
 def scrape_page(source):
     try:
         r = requests.get(source["url"], headers=HEADERS, timeout=20)
@@ -214,22 +174,8 @@ def scrape_page(source):
                 continue
             if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
                 continue
-            # Try to grab date from the row (may be None)
-            dt = None
-            for cell in row.find_all(["td", "th"]):
-                m = re.search(r'(\d{1,2}\s+\w+\s*,?\s*\d{4})', cell.get_text(" ", strip=True))
-                if m:
-                    ds = m.group(1).replace(",", "")
-                    for fmt in ("%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y"):
-                        try:
-                            dt = datetime.strptime(ds, fmt)
-                            break
-                        except:
-                            continue
-                    if dt:
-                        break
             abs_url = urljoin(source["url"], href)
-            items.append({"date": dt, "title": title, "url": abs_url})
+            items.append({"title": title, "url": abs_url, "tag": source["tag"], "category": source["label"]})
             if len(items) >= 20:
                 break
         return items
@@ -237,44 +183,39 @@ def scrape_page(source):
         print(f"⚠️ Error scraping {source['label']}: {e}")
         return []
 
-def fetch_items():
-    all_items = []
-    for src in SOURCES:
-        items = scrape_page(src)
-        print(f"[DEBUG] Scraped {len(items)} items from {src['label']}")
-        for it in items:
-            it["tag"] = src["tag"]
-            it["category"] = src["label"]
-        all_items.extend(items)
-    # Enrich with summary and page date
-    enriched = []
-    for it in all_items:
-        summary, page_date = generate_summary_and_date(it["url"], it["title"])
-        # Use page_date if row date was missing
-        final_date = it["date"] if it["date"] else page_date
-        enriched.append({
-            "title": it["title"],
-            "link": it["url"],
-            "pub_date": final_date,
-            "description": summary,
-            "category": it["category"],
-            "tag": it["tag"]
-        })
-    return enriched
-
 # ─── Main ────────────────────────────────────────────────
 def main():
     seen = load_seen()
     today_str = datetime.now().strftime("%d %b %Y")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scraping RBI website...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Scraping listing pages...")
 
-    items = fetch_items()
-    if not items:
+    all_items = []
+    for src in SOURCES:
+        items = scrape_page(src)
+        print(f"[DEBUG] {src['label']}: {len(items)} items")
+        all_items.extend(items)
+
+    # Enrich with detail data
+    enriched = []
+    for item in all_items:
+        dt, summary = fetch_detail(item["url"])
+        # Use date from detail if available, else try to find in title (rare)
+        pub_date = dt
+        enriched.append({
+            "title": item["title"],
+            "link": item["url"],
+            "pub_date": pub_date,
+            "description": summary,
+            "category": item["category"],
+            "tag": item["tag"]
+        })
+
+    if not enriched:
         send(f"🏦 <b>RBI Bot — {today_str}</b>\n⚠️ Could not fetch updates today.")
         return
 
     new_items = []
-    for item in items:
+    for item in enriched:
         tag = item["tag"]
         if tag not in seen:
             seen[tag] = []
@@ -293,7 +234,7 @@ def main():
         )
         for item in new_items:
             title = item["title"]
-            summary = clean_text(item.get("description", ""), title)
+            summary = item.get("description", "")
             is_exam = any(kw in title.lower() for kw in EXAM_KEYWORDS)
             prefix = "⭐ <b>EXAM-RELEVANT</b>\n" if is_exam else ""
             entities = extract_entities(summary) if summary else extract_entities(title)
@@ -306,8 +247,9 @@ def main():
             send(msg)
         print(f"✅ Sent {len(new_items)} new items.")
     else:
+        # Monthly roundup
         cutoff = datetime.now() - timedelta(days=30)
-        monthly = [it for it in items if it["pub_date"] is None or it["pub_date"] >= cutoff]
+        monthly = [it for it in enriched if it["pub_date"] is None or it["pub_date"] >= cutoff]
         unique = {}
         for it in monthly:
             if it["link"] not in unique:
@@ -335,7 +277,7 @@ def main():
             lines.append("🔹 <b>Recent highlights:</b>")
             for item in monthly[:10]:
                 date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "Recent"
-                summary = clean_text(item.get("description", ""), item["title"])
+                summary = item.get("description", "")
                 entities = extract_entities(summary) if summary else extract_entities(item["title"])
                 affected = f" | Affected: {', '.join(entities)}" if entities else ""
                 lines.append(
