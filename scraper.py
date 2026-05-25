@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
@@ -76,6 +77,25 @@ def is_exam_relevant(title):
     title_lower = title.lower()
     return any(kw in title_lower for kw in EXAM_KEYWORDS)
 
+def fetch_summary(url):
+    """Scrape the detail page and return first 300 characters of meaningful text."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        # Try common content containers
+        content = soup.select_one("#content, .content, .maincontent, .bodytext, article")
+        if not content:
+            content = soup
+        # Extract text, remove extra whitespace
+        text = content.get_text(separator=" ", strip=True)
+        # Clean up multiple spaces
+        text = " ".join(text.split())
+        # Return first 300 characters
+        return text[:300] + ("…" if len(text) > 300 else "")
+    except Exception:
+        return ""  # fallback silently
+
 def scrape_with_dates(source):
     """Return list of {date, title, url} for top items on a page."""
     try:
@@ -84,15 +104,12 @@ def scrape_with_dates(source):
         soup = BeautifulSoup(r.text, "html.parser")
         items = []
 
-        # Most RBI listing pages use a table with rows containing date + link
         for row in soup.select("table tr"):
             cells = row.find_all("td")
             if len(cells) < 2:
                 continue
-            # Try to find a date in the first cell
             date_cell = cells[0].get_text(strip=True)
             dt = parse_date(date_cell)
-            # Look for a link in any cell
             a_tag = row.find("a", href=True)
             if not a_tag:
                 continue
@@ -100,7 +117,6 @@ def scrape_with_dates(source):
             title = a_tag.get_text(" ", strip=True)
             if not title or len(title) < 8:
                 continue
-            # Skip navigation/header links
             if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
                 continue
             if not href.startswith("http"):
@@ -111,7 +127,7 @@ def scrape_with_dates(source):
                 "title": title,
                 "url": href
             })
-            if len(items) >= 20:   # grab enough for monthly recap
+            if len(items) >= 20:
                 break
 
         # If no dates found, fall back: return items without dates (date=None)
@@ -149,7 +165,7 @@ def scrape(source):
         return []
 
 def send(text):
-    """Send a Telegram message."""
+    """Send a Telegram message (max 4096 chars, but we keep messages shorter)."""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -163,7 +179,7 @@ def send(text):
     except Exception as e:
         print(f"  ⚠️  Telegram error: {e}")
 
-# ─── Monthly summary builder ──────────────────────────────
+# ─── Monthly summary builder (with summaries) ────────────
 def get_monthly_summary():
     """Fetch items from all sources, keep those within last 30 days, return formatted summary."""
     cutoff = datetime.now() - timedelta(days=30)
@@ -172,7 +188,7 @@ def get_monthly_summary():
     for source in SOURCES:
         items = scrape_with_dates(source)
         for item in items:
-            # ✅ FIX: include items without a date (assume they are recent)
+            # Include items without a date (assume they are recent)
             if item["date"] is None or item["date"] >= cutoff:
                 all_items.append({**item, "tag": source["tag"], "label": source["label"]})
 
@@ -208,16 +224,21 @@ def get_monthly_summary():
         lines.append(f"{label}: {count} item(s)")
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("🔹 <b>Recent highlights:</b>")
+    lines.append("🔹 <b>Recent highlights (with summaries):</b>")
 
-    # Show the 10 most recent items
+    # Show top 10 most recent items, each with summary
     for item in unique[:10]:
         date_str = item["date"].strftime("%d %b") if item["date"] else "?"
         title_short = item["title"][:120]
-        lines.append(
-            f"• {item['label']} ({date_str})\n"
-            f"  <a href='{item['url']}'>{title_short}</a>"
-        )
+        summary = fetch_summary(item["url"])
+        # Format: title, then summary, then link
+        block = f"• {item['label']} ({date_str})\n  <b>{title_short}</b>"
+        if summary:
+            # Trim summary to fit nicely (approx 250 chars)
+            summary_short = summary[:250]
+            block += f"\n  <i>{summary_short}</i>"
+        block += f"\n  <a href='{item['url']}'>📄 Read full update</a>"
+        lines.append(block)
 
     if len(unique) > 10:
         lines.append(f"… and {len(unique) - 10} more")
@@ -255,7 +276,7 @@ def main():
                     "exam": is_exam_relevant(item["title"])
                 })
 
-    # ── Send daily results ────────────────────────────────
+    # ── Send daily results (with summaries for new items) ─
     if new_items:
         # Header
         send(
@@ -264,18 +285,23 @@ def main():
             f"Found <b>{len(new_items)}</b> new item(s) today!\n"
             f"🔗 <a href='https://www.rbi.org.in'>rbi.org.in</a>\n"
         )
-        for item in new_items:
+        for i, item in enumerate(new_items):
             title = item["title"][:200]
             prefix = "⭐ EXAM-RELEVANT: " if item["exam"] else ""
-            msg = (
-                f"{item['label']}\n"
-                f"{prefix}<b>{title}</b>\n"
-                f"<a href='{item['url']}'>📄 Read full update</a>"
-            )
+            summary = ""
+            # Fetch summary only for the first 10 new items (to avoid too many requests)
+            if i < 10:
+                summary = fetch_summary(item["url"])
+                time.sleep(0.5)  # polite delay
+
+            msg = f"{item['label']}\n{prefix}<b>{title}</b>"
+            if summary:
+                msg += f"\n<i>{summary[:250]}</i>"
+            msg += f"\n<a href='{item['url']}'>📄 Read full update</a>"
             send(msg)
         print(f"  ✅ Sent {len(new_items)} new items to Telegram.")
     else:
-        # No new updates → send monthly roundup
+        # No new updates → send monthly roundup (with summaries for highlights)
         monthly_msg = get_monthly_summary()
         if monthly_msg:
             msg = f"🏦 <b>RBI Bot — {today_str}</b>\n✅ No new updates today.\n\n" + monthly_msg
