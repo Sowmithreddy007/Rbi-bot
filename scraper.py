@@ -83,12 +83,13 @@ def extract_entities(text):
     return found
 
 def clean_text(text):
-    """Remove RBI metadata line and repeated title from the start of text."""
-    # Remove the metadata line like "Press Releases ( 153 kb ) Date : May 22, 2026"
+    """Remove any RBI metadata line and repeated titles from the start."""
+    # Remove lines like: "Press Releases ( 153 kb ) Date : May 22, 2026"
+    # Also handles cases where only "( 153 kb ) Date : ..." remains
     text = re.sub(
-        r"^[A-Za-z\s]+\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s+\d{4}\s*",
+        r"^(?:[A-Za-z\s]+)?\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s*,?\s*\d{4}\s*",
         "", text, flags=re.IGNORECASE).strip()
-    # Remove common leading "Press Release" alone if it remains
+    # Remove leading "Press Release" alone
     text = re.sub(r"^(Press Releases?)\s*", "", text, flags=re.IGNORECASE).strip()
     return text
 
@@ -103,9 +104,7 @@ def generate_summary(url, title=""):
         sentences = summarizer(parser.document, SENTENCES_COUNT)
         summary = " ".join(str(s) for s in parser.document.sentences if s in sentences)
         summary = re.sub(r'\s+', ' ', summary).strip()
-        # Remove metadata if present
         summary = clean_text(summary)
-        # If title appears at the start, remove it
         if summary.lower().startswith(title.lower()):
             summary = summary[len(title):].strip()
         if summary:
@@ -113,7 +112,7 @@ def generate_summary(url, title=""):
     except Exception as e:
         print(f"⚠️ Sumy failed, using fallback: {e}")
 
-    # Fallback: scrape the article page and extract first 300 chars of main text
+    # Fallback: scrape first 300 chars of article text
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -126,7 +125,6 @@ def generate_summary(url, title=""):
         text = content.get_text(separator=" ", strip=True)
         text = re.sub(r'\s+', ' ', text).strip()
         text = clean_text(text)
-        # Remove title if repeated at start
         if text.lower().startswith(title.lower()):
             text = text[len(title):].strip()
         return text[:300] + ("…" if len(text) > 300 else "")
@@ -152,13 +150,14 @@ def send(text):
         print(f"⚠️ Telegram error: {e}")
 
 def find_date_in_row(row):
-    """Look through all cells of a row for a date pattern, return first match."""
-    date_pattern = re.compile(r'(\d{1,2}\s+\w+\s+\d{4})')
-    for cell in row.find_all("td"):
+    """Look through all cells of a row for a date (with or without comma), return datetime or None."""
+    # Pattern matches: "May 25, 2026", "25 May 2026", "May 25 2026" etc.
+    date_regex = re.compile(r'(\d{1,2}\s+\w+\s*,?\s*\d{4})')
+    for cell in row.find_all(["td", "th"]):
         text = cell.get_text(" ", strip=True)
-        match = date_pattern.search(text)
+        match = date_regex.search(text)
         if match:
-            date_str = match.group(1)
+            date_str = match.group(1).replace(",", "")  # remove comma
             for fmt in ("%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y"):
                 try:
                     return datetime.strptime(date_str, fmt)
@@ -173,7 +172,6 @@ def scrape_page(source):
         soup = BeautifulSoup(r.text, "html.parser")
         items = []
         for row in soup.select("table tr"):
-            # Find a link in the row
             a_tag = row.find("a", href=True)
             if not a_tag:
                 continue
@@ -183,7 +181,6 @@ def scrape_page(source):
                 continue
             if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
                 continue
-            # Find the date from any cell in this row
             dt = find_date_in_row(row)
             abs_url = urljoin(source["url"], href)
             items.append({"date": dt, "title": title, "url": abs_url})
@@ -208,7 +205,6 @@ def main():
             it["category"] = src["label"]
         all_items.extend(items)
 
-    # Convert to uniform format
     items = []
     for it in all_items:
         items.append({
@@ -248,11 +244,10 @@ def main():
         for idx, item in enumerate(new_items):
             try:
                 title = item["title"]
-                # Generate summary (AI or fallback)
                 summary = generate_summary(item["link"], title) if idx < 10 else ""
                 is_exam = any(kw in title.lower() for kw in EXAM_KEYWORDS)
                 prefix = "⭐ <b>EXAM-RELEVANT</b>\n" if is_exam else ""
-                # Extract entities from summary, or fallback to title
+                # Use summary, fallback to title for entity extraction
                 entities = extract_entities(summary) if summary else extract_entities(title)
                 affected = f"\n🎯 <b>Affected:</b> {', '.join(entities)}" if entities else ""
                 date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "?"
@@ -270,7 +265,6 @@ def main():
                 traceback.print_exc()
         print(f"✅ Sent {len(new_items)} new items.")
     else:
-        # Monthly roundup (last 30 days)
         cutoff = datetime.now() - timedelta(days=30)
         monthly = []
         for it in items:
