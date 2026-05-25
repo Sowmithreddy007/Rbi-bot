@@ -78,23 +78,67 @@ def is_exam_relevant(title):
     return any(kw in title_lower for kw in EXAM_KEYWORDS)
 
 def fetch_summary(url):
-    """Scrape the detail page and return first 300 characters of meaningful text."""
+    """
+    Scrape the detail page and return the first 300 characters of the
+    main article text, without the RBI site navigation header.
+    """
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        # Try common content containers
-        content = soup.select_one("#content, .content, .maincontent, .bodytext, article")
-        if not content:
-            content = soup
-        # Extract text, remove extra whitespace
-        text = content.get_text(separator=" ", strip=True)
-        # Clean up multiple spaces
-        text = " ".join(text.split())
-        # Return first 300 characters
-        return text[:300] + ("…" if len(text) > 300 else "")
+
+        # Remove clearly irrelevant elements
+        for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
+            tag.decompose()
+
+        # Strategy 1: Try common content containers
+        content = soup.select_one(
+            "#content, .content, .main-content, .entry-content, .pressrelease, "
+            "article, [role='main'], .page-content, .post-content"
+        )
+        if content:
+            text = content.get_text(separator=" ", strip=True)
+            text = " ".join(text.split())
+            if len(text) > 150:
+                return text[:300] + ("…" if len(text) > 300 else "")
+
+        # Strategy 2: Find the column with the most text (Bootstrap layout)
+        cols = soup.select('div[class*="col-"]')
+        if cols:
+            best = max(cols, key=lambda c: len(c.get_text()))
+            text = best.get_text(separator=" ", strip=True)
+            text = " ".join(text.split())
+            if len(text) > 150:
+                return text[:300] + ("…" if len(text) > 300 else "")
+
+        # Strategy 3: Fallback – filter out RBI navigation boilerplate
+        body_text = soup.body.get_text(separator="\n") if soup.body else ""
+        lines = [line.strip() for line in body_text.splitlines() if line.strip()]
+        skip_keywords = [
+            "skip to main content", "search the website", "home", "about us",
+            "organisation & functions", "organisation structure", "departments",
+            "offices", "training establishment", "college of agricultural banking",
+            "reserve bank staff college", "site map", "accessibility", "screen reader",
+            "go to navigation", "go to content"
+        ]
+        clean_lines = []
+        for line in lines:
+            lower = line.lower()
+            if any(kw in lower for kw in skip_keywords):
+                continue
+            if len(line) < 20:
+                continue
+            clean_lines.append(line)
+
+        cleaned_text = " ".join(clean_lines)
+        cleaned_text = " ".join(cleaned_text.split())
+        if cleaned_text:
+            return cleaned_text[:300] + ("…" if len(cleaned_text) > 300 else "")
+
+        return ""
+
     except Exception:
-        return ""  # fallback silently
+        return ""
 
 def scrape_with_dates(source):
     """Return list of {date, title, url} for top items on a page."""
@@ -165,7 +209,7 @@ def scrape(source):
         return []
 
 def send(text):
-    """Send a Telegram message (max 4096 chars, but we keep messages shorter)."""
+    """Send a Telegram message."""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -231,10 +275,8 @@ def get_monthly_summary():
         date_str = item["date"].strftime("%d %b") if item["date"] else "?"
         title_short = item["title"][:120]
         summary = fetch_summary(item["url"])
-        # Format: title, then summary, then link
         block = f"• {item['label']} ({date_str})\n  <b>{title_short}</b>"
         if summary:
-            # Trim summary to fit nicely (approx 250 chars)
             summary_short = summary[:250]
             block += f"\n  <i>{summary_short}</i>"
         block += f"\n  <a href='{item['url']}'>📄 Read full update</a>"
@@ -289,10 +331,9 @@ def main():
             title = item["title"][:200]
             prefix = "⭐ EXAM-RELEVANT: " if item["exam"] else ""
             summary = ""
-            # Fetch summary only for the first 10 new items (to avoid too many requests)
-            if i < 10:
+            if i < 10:   # fetch summary for first 10 new items to save time
                 summary = fetch_summary(item["url"])
-                time.sleep(0.5)  # polite delay
+                time.sleep(0.5)
 
             msg = f"{item['label']}\n{prefix}<b>{title}</b>"
             if summary:
