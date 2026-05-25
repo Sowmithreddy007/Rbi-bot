@@ -83,25 +83,39 @@ def extract_entities(text):
 
 def generate_summary(url):
     """
-    Fetch the full article text, then use sumy to extract a short summary.
-    Returns a plain-text summary string or empty on failure.
+    Try sumy LSA summarizer; if it fails, fall back to a clean 300‑char snippet.
     """
+    # Attempt AI summary
     try:
         parser = HtmlParser.from_url(url, Tokenizer(LANGUAGE))
         stemmer = Stemmer(LANGUAGE)
         summarizer = LsaSummarizer(stemmer)
         summarizer.stop_words = get_stop_words(LANGUAGE)
         sentences = summarizer(parser.document, SENTENCES_COUNT)
-        # Reconstruct the summary in original order
-        summary = " ".join(str(s) for s in parser.document.sentences
-                           if s in sentences)
-        # Clean up excessive whitespace
+        summary = " ".join(str(s) for s in parser.document.sentences if s in sentences)
         summary = re.sub(r'\s+', ' ', summary).strip()
-        # Remove RBI boilerplate if it leaked in
         summary = re.sub(r"Press Releases?\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s+\d{4}\s*", "", summary).strip()
-        return summary[:500]  # keep under Telegram limit
+        if summary:
+            return summary[:500]
     except Exception as e:
-        print(f"⚠️ Summarization failed for {url}: {e}")
+        print(f"⚠️ Sumy failed, using fallback: {e}")
+
+    # Fallback: clean first 300 characters from the article body
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
+            tag.decompose()
+        content = soup.select_one("#content, article, [role='main'], .pressrelease")
+        if not content:
+            content = soup
+        text = content.get_text(separator=" ", strip=True)
+        text = re.sub(r'\s+', ' ', text).strip()
+        text = re.sub(r"Press Releases?\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s+\d{4}\s*", "", text).strip()
+        return text[:300] + ("…" if len(text) > 300 else "")
+    except Exception as e:
+        print(f"⚠️ Fallback summary also failed: {e}")
         return ""
 
 def send(text):
@@ -122,7 +136,6 @@ def send(text):
         print(f"⚠️ Telegram error: {e}")
 
 def parse_date_from_cell(cell_text):
-    # robust date finder: look for day-month-year pattern
     match = re.search(r'(\d{1,2}\s+\w+\s+\d{4})', cell_text)
     if match:
         date_str = match.group(1)
@@ -177,7 +190,7 @@ def main():
             it["category"] = src["label"]
         all_items.extend(items)
 
-    # Convert to uniform format
+    # Convert to unified format
     items = []
     for it in all_items:
         items.append({
@@ -218,7 +231,7 @@ def main():
         for idx, item in enumerate(new_items):
             try:
                 title = item["title"]
-                # Generate AI‑style summary (first 10 items only to keep runtime low)
+                # Summarize only first 10 to save time
                 summary = generate_summary(item["link"]) if idx < 10 else ""
                 is_exam = any(kw in title.lower() for kw in EXAM_KEYWORDS)
                 prefix = "⭐ <b>EXAM-RELEVANT</b>\n" if is_exam else ""
@@ -239,7 +252,7 @@ def main():
                 traceback.print_exc()
         print(f"✅ Sent {len(new_items)} new items.")
     else:
-        # Monthly roundup (with summaries)
+        # Monthly roundup
         cutoff = datetime.now() - timedelta(days=30)
         monthly = []
         for it in items:
@@ -269,7 +282,7 @@ def main():
                 lines.append(f"{cat}: {cnt} item(s)")
             lines.append("")
             lines.append("━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("🔹 <b>Recent highlights (AI summary):</b>")
+            lines.append("🔹 <b>Recent highlights:</b>")
             for item in monthly[:10]:
                 try:
                     date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "?"
