@@ -172,7 +172,8 @@ def get_monthly_summary():
     for source in SOURCES:
         items = scrape_with_dates(source)
         for item in items:
-            if item["date"] and item["date"] >= cutoff:
+            # ✅ FIX: include items without a date (assume they are recent)
+            if item["date"] is None or item["date"] >= cutoff:
                 all_items.append({**item, "tag": source["tag"], "label": source["label"]})
 
     # Deduplicate by URL
@@ -183,8 +184,8 @@ def get_monthly_summary():
             seen_urls.add(item["url"])
             unique.append(item)
 
-    # Sort by date descending
-    unique.sort(key=lambda x: x["date"], reverse=True)
+    # Sort by date descending, items with None date go last
+    unique.sort(key=lambda x: (x["date"] is not None, x["date"] or datetime.min), reverse=True)
 
     if not unique:
         return None
@@ -251,7 +252,7 @@ def main():
                     "label": label,
                     "title": item["title"],
                     "url": url,
-                    "exam": is_exam_relevant(item["title"])   # tag as exam relevant
+                    "exam": is_exam_relevant(item["title"])
                 })
 
     # ── Send daily results ────────────────────────────────
