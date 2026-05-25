@@ -4,6 +4,7 @@ import time
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
+from urllib.parse import urljoin
 
 # ─── Config ──────────────────────────────────────────────
 TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -81,11 +82,17 @@ def fetch_summary(url):
     """
     Scrape the detail page and return the first 300 characters of the
     main article text, without the RBI site navigation header.
+    Returns empty string if the page is an error page or inaccessible.
     """
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
+
+        # Check if we landed on an error page
+        page_text = soup.get_text()
+        if "sorry for your inconvenience" in page_text.lower():
+            return ""   # invalid article URL
 
         # Remove clearly irrelevant elements
         for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
@@ -163,13 +170,14 @@ def scrape_with_dates(source):
                 continue
             if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
                 continue
-            if not href.startswith("http"):
-                href = BASE + "/" + href.lstrip("/")
+
+            # ✅ Fix: properly resolve relative URLs using the listing page as base
+            abs_url = urljoin(source["url"], href)
 
             items.append({
                 "date": dt,
                 "title": title,
-                "url": href
+                "url": abs_url
             })
             if len(items) >= 20:
                 break
@@ -198,9 +206,9 @@ def scrape(source):
                 continue
             if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
                 continue
-            if not href.startswith("http"):
-                href = BASE + "/" + href.lstrip("/")
-            items.append((title, href))
+
+            abs_url = urljoin(source["url"], href)
+            items.append((title, abs_url))
             if len(items) >= 15:
                 break
         return items
@@ -232,11 +240,9 @@ def get_monthly_summary():
     for source in SOURCES:
         items = scrape_with_dates(source)
         for item in items:
-            # Include items without a date (assume they are recent)
             if item["date"] is None or item["date"] >= cutoff:
                 all_items.append({**item, "tag": source["tag"], "label": source["label"]})
 
-    # Deduplicate by URL
     seen_urls = set()
     unique = []
     for item in all_items:
@@ -244,18 +250,15 @@ def get_monthly_summary():
             seen_urls.add(item["url"])
             unique.append(item)
 
-    # Sort by date descending, items with None date go last
     unique.sort(key=lambda x: (x["date"] is not None, x["date"] or datetime.min), reverse=True)
 
     if not unique:
         return None
 
-    # Count by category
     counts = {}
     for item in unique:
         counts[item["label"]] = counts.get(item["label"], 0) + 1
 
-    # Build message
     today = datetime.now().strftime("%d %b %Y")
     lines = [
         f"📊 <b>RBI Monthly Roundup (last 30 days)</b>",
@@ -270,7 +273,6 @@ def get_monthly_summary():
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
     lines.append("🔹 <b>Recent highlights (with summaries):</b>")
 
-    # Show top 10 most recent items, each with summary
     for item in unique[:10]:
         date_str = item["date"].strftime("%d %b") if item["date"] else "?"
         title_short = item["title"][:120]
@@ -318,9 +320,7 @@ def main():
                     "exam": is_exam_relevant(item["title"])
                 })
 
-    # ── Send daily results (with summaries for new items) ─
     if new_items:
-        # Header
         send(
             f"🏦 <b>RBI Update — {today_str}</b>\n"
             f"{'─' * 28}\n"
@@ -331,7 +331,7 @@ def main():
             title = item["title"][:200]
             prefix = "⭐ EXAM-RELEVANT: " if item["exam"] else ""
             summary = ""
-            if i < 10:   # fetch summary for first 10 new items to save time
+            if i < 10:
                 summary = fetch_summary(item["url"])
                 time.sleep(0.5)
 
@@ -342,7 +342,6 @@ def main():
             send(msg)
         print(f"  ✅ Sent {len(new_items)} new items to Telegram.")
     else:
-        # No new updates → send monthly roundup (with summaries for highlights)
         monthly_msg = get_monthly_summary()
         if monthly_msg:
             msg = f"🏦 <b>RBI Bot — {today_str}</b>\n✅ No new updates today.\n\n" + monthly_msg
