@@ -11,6 +11,19 @@ SEEN_FILE = "seen.json"
 BASE    = "https://www.rbi.org.in"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RBI-Bot/1.0)"}
 
+# ─── Exam priority keywords ──────────────────────────────
+EXAM_KEYWORDS = [
+    "repo rate", "reverse repo", "crr", "slr", "marginal standing facility",
+    "monetary policy", "mpc", "monetary policy committee",
+    "priority sector", "financial inclusion", "digital lending",
+    "upi", "payment system", "banking regulation", "co-operative bank",
+    "nbfc", "microfinance", "rbi act", "banking regulation act",
+    "br act", "sarfaesi", "insolvency", "ibc", "forex", "foreign exchange",
+    "capital adequacy", "cet", "tier", "basel", "prudential",
+    "kyc", "aml", "anti money laundering", "ctr", "str",
+    "ombudsman", "consumer protection", "dpt", "deposit insurance",
+]
+
 # ─── Sources to scrape ───────────────────────────────────
 SOURCES = [
     {
@@ -58,6 +71,11 @@ def parse_date(text):
             continue
     return None
 
+def is_exam_relevant(title):
+    """Return True if the title contains any exam keyword (case-insensitive)."""
+    title_lower = title.lower()
+    return any(kw in title_lower for kw in EXAM_KEYWORDS)
+
 def scrape_with_dates(source):
     """Return list of {date, title, url} for top items on a page."""
     try:
@@ -67,7 +85,6 @@ def scrape_with_dates(source):
         items = []
 
         # Most RBI listing pages use a table with rows containing date + link
-        # Common pattern: <tr> with <td class="tableheader">date</td> then <td> <a>title</a> </td>
         for row in soup.select("table tr"):
             cells = row.find_all("td")
             if len(cells) < 2:
@@ -83,7 +100,7 @@ def scrape_with_dates(source):
             title = a_tag.get_text(" ", strip=True)
             if not title or len(title) < 8:
                 continue
-            # Clean URL
+            # Skip navigation/header links
             if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
                 continue
             if not href.startswith("http"):
@@ -94,12 +111,11 @@ def scrape_with_dates(source):
                 "title": title,
                 "url": href
             })
-            if len(items) >= 20:   # grab enough for weekly recap
+            if len(items) >= 20:   # grab enough for monthly recap
                 break
 
         # If no dates found, fall back: return items without dates (date=None)
         if not any(item["date"] for item in items):
-            # Just scrape titles/urls without dates
             plain_items = scrape(source)
             return [{"date": None, "title": t, "url": u} for t, u in plain_items]
 
@@ -109,7 +125,7 @@ def scrape_with_dates(source):
         return []
 
 def scrape(source):
-    """Original scraper (kept for backward compat) returns list of (title, url)."""
+    """Fallback scraper that returns list of (title, url)."""
     try:
         r = requests.get(source["url"], headers=HEADERS, timeout=20)
         r.raise_for_status()
@@ -147,10 +163,10 @@ def send(text):
     except Exception as e:
         print(f"  ⚠️  Telegram error: {e}")
 
-# ─── Weekly summary builder ──────────────────────────────
-def get_weekly_summary():
-    """Fetch items from all sources, keep those within last 7 days, return formatted summary string."""
-    cutoff = datetime.now() - timedelta(days=7)
+# ─── Monthly summary builder ──────────────────────────────
+def get_monthly_summary():
+    """Fetch items from all sources, keep those within last 30 days, return formatted summary."""
+    cutoff = datetime.now() - timedelta(days=30)
     all_items = []
 
     for source in SOURCES:
@@ -181,7 +197,7 @@ def get_weekly_summary():
     # Build message
     today = datetime.now().strftime("%d %b %Y")
     lines = [
-        f"📊 <b>RBI Weekly Roundup (last 7 days)</b>",
+        f"📊 <b>RBI Monthly Roundup (last 30 days)</b>",
         f"━━━━━━━━━━━━━━━━━━━━━",
         f"📆 Period: {cutoff.strftime('%d %b')} – {today}",
         f"📌 Total updates: {len(unique)}",
@@ -226,13 +242,17 @@ def main():
         if tag not in seen:
             seen[tag] = []
 
-        # Use scraper that gives dates, but we only care about URL for new detection
         items = scrape_with_dates(source)
         for item in items:
             url = item["url"]
             if url not in seen[tag]:
                 seen[tag].append(url)
-                new_items.append({"label": label, "title": item["title"], "url": url})
+                new_items.append({
+                    "label": label,
+                    "title": item["title"],
+                    "url": url,
+                    "exam": is_exam_relevant(item["title"])   # tag as exam relevant
+                })
 
     # ── Send daily results ────────────────────────────────
     if new_items:
@@ -240,33 +260,32 @@ def main():
         send(
             f"🏦 <b>RBI Update — {today_str}</b>\n"
             f"{'─' * 28}\n"
-            f"Found <b>{len(new_items)}</b> new item(s) today!\n\n"
-            f"🔗 <a href='https://www.rbi.org.in'>rbi.org.in</a>"
+            f"Found <b>{len(new_items)}</b> new item(s) today!\n"
+            f"🔗 <a href='https://www.rbi.org.in'>rbi.org.in</a>\n"
         )
         for item in new_items:
             title = item["title"][:200]
+            prefix = "⭐ EXAM-RELEVANT: " if item["exam"] else ""
             msg = (
                 f"{item['label']}\n"
-                f"<b>{title}</b>\n"
+                f"{prefix}<b>{title}</b>\n"
                 f"<a href='{item['url']}'>📄 Read full update</a>"
             )
             send(msg)
         print(f"  ✅ Sent {len(new_items)} new items to Telegram.")
     else:
-        # No new updates → send weekly roundup
-        weekly_msg = get_weekly_summary()
-        if weekly_msg:
-            # Prepend a note that today there were no new items
-            msg = f"🏦 <b>RBI Bot — {today_str}</b>\n✅ No new updates today.\n\n" + weekly_msg
+        # No new updates → send monthly roundup
+        monthly_msg = get_monthly_summary()
+        if monthly_msg:
+            msg = f"🏦 <b>RBI Bot — {today_str}</b>\n✅ No new updates today.\n\n" + monthly_msg
             send(msg)
-            print("  ✅ No new items. Weekly summary sent.")
+            print("  ✅ No new items. Monthly summary sent.")
         else:
-            # Even weekly summary came back empty (unlikely but possible)
             send(
                 f"🏦 <b>RBI Bot — {today_str}</b>\n"
                 f"{'─' * 28}\n"
                 f"✅ No new updates from RBI today.\n"
-                f"No updates in the last 7 days either.\n"
+                f"No updates in the last 30 days either.\n"
                 f"Your bot is alive and watching! 👀"
             )
             print("  ✅ No updates at all. Heartbeat sent.")
