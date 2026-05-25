@@ -6,6 +6,11 @@ import requests
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from sumy.parsers.html import HtmlParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lsa import LsaSummarizer
+from sumy.nlp.stemmers import Stemmer
+from sumy.utils import get_stop_words
 
 # ─── Config ──────────────────────────────────────────────
 TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -51,6 +56,9 @@ ENTITY_PATTERNS = [
     (r"scheduled\s+banks", "Scheduled Banks"),
 ]
 
+LANGUAGE = "english"
+SENTENCES_COUNT = 2
+
 def load_seen():
     try:
         with open(SEEN_FILE) as f:
@@ -73,13 +81,28 @@ def extract_entities(text):
                 found.append(label)
     return found
 
-def clean_summary(raw, title=""):
-    if raw.startswith(title):
-        raw = raw[len(title):].strip()
-    cleaned = re.sub(
-        r"^(Press Releases?|Circulars?|Notifications?|What's New)\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s+\d{4}\s*",
-        "", raw).strip()
-    return cleaned[:250] + ("…" if len(cleaned) > 250 else "")
+def generate_summary(url):
+    """
+    Fetch the full article text, then use sumy to extract a short summary.
+    Returns a plain-text summary string or empty on failure.
+    """
+    try:
+        parser = HtmlParser.from_url(url, Tokenizer(LANGUAGE))
+        stemmer = Stemmer(LANGUAGE)
+        summarizer = LsaSummarizer(stemmer)
+        summarizer.stop_words = get_stop_words(LANGUAGE)
+        sentences = summarizer(parser.document, SENTENCES_COUNT)
+        # Reconstruct the summary in original order
+        summary = " ".join(str(s) for s in parser.document.sentences
+                           if s in sentences)
+        # Clean up excessive whitespace
+        summary = re.sub(r'\s+', ' ', summary).strip()
+        # Remove RBI boilerplate if it leaked in
+        summary = re.sub(r"Press Releases?\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s+\d{4}\s*", "", summary).strip()
+        return summary[:500]  # keep under Telegram limit
+    except Exception as e:
+        print(f"⚠️ Summarization failed for {url}: {e}")
+        return ""
 
 def send(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -99,11 +122,11 @@ def send(text):
         print(f"⚠️ Telegram error: {e}")
 
 def parse_date_from_cell(cell_text):
-    # cell_text might contain extra whitespace/newlines; look for a date pattern
+    # robust date finder: look for day-month-year pattern
     match = re.search(r'(\d{1,2}\s+\w+\s+\d{4})', cell_text)
     if match:
         date_str = match.group(1)
-        for fmt in ["%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y"]:
+        for fmt in ("%d %B %Y", "%B %d %Y", "%d %b %Y", "%b %d %Y"):
             try:
                 return datetime.strptime(date_str, fmt)
             except:
@@ -120,7 +143,6 @@ def scrape_page(source):
             cells = row.find_all("td")
             if len(cells) < 2:
                 continue
-            # Get the full text content of the first cell
             cell_text = cells[0].get_text(" ", strip=True)
             dt = parse_date_from_cell(cell_text)
             a_tag = row.find("a", href=True)
@@ -136,44 +158,10 @@ def scrape_page(source):
             items.append({"date": dt, "title": title, "url": abs_url})
             if len(items) >= 20:
                 break
-        # If we got any items, return them; if none, return empty
         return items
     except Exception as e:
         print(f"⚠️ Error scraping {source['label']}: {e}")
         return []
-
-def fetch_summary_from_url(url):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        if "sorry for your inconvenience" in soup.get_text().lower():
-            return ""
-        for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
-            tag.decompose()
-        content = soup.select_one("#content, article, [role='main'], .pressrelease")
-        if content:
-            text = content.get_text(separator=" ", strip=True)
-            text = " ".join(text.split())
-            if len(text) > 150:
-                return clean_summary(text)
-        cols = soup.select('div[class*="col-"]')
-        if cols:
-            best = max(cols, key=lambda c: len(c.get_text()))
-            text = best.get_text(separator=" ", strip=True)
-            text = " ".join(text.split())
-            if len(text) > 150:
-                return clean_summary(text)
-        body = soup.body.get_text(separator="\n") if soup.body else ""
-        lines = [line.strip() for line in body.splitlines() if line.strip()]
-        skip = ["skip to main content", "search the website", "home", "about us",
-                "organisation", "site map", "screen reader"]
-        clean_lines = [l for l in lines if not any(k in l.lower() for k in skip) and len(l) > 20]
-        text = " ".join(clean_lines)
-        return clean_summary(text)
-    except Exception as e:
-        print(f"⚠️ Error fetching summary from {url}: {e}")
-        return ""
 
 def main():
     seen = load_seen()
@@ -189,14 +177,13 @@ def main():
             it["category"] = src["label"]
         all_items.extend(items)
 
-    # Convert to unified format
+    # Convert to uniform format
     items = []
     for it in all_items:
         items.append({
             "title": it["title"],
             "link": it["url"],
             "pub_date": it["date"],
-            "description": "",
             "category": it["category"],
             "tag": it["tag"]
         })
@@ -205,7 +192,7 @@ def main():
         send(f"🏦 <b>RBI Bot — {today_str}</b>\n⚠️ Could not fetch updates today.")
         return
 
-    # Identify new items (not in seen.json)
+    # Identify new items
     new_items = []
     for item in items:
         tag = item["tag"]
@@ -231,12 +218,11 @@ def main():
         for idx, item in enumerate(new_items):
             try:
                 title = item["title"]
-                # Only fetch summary for first 10 to stay within time
-                desc = fetch_summary_from_url(item["link"]) if idx < 10 else ""
-                summary = clean_summary(desc, title) if desc else ""
+                # Generate AI‑style summary (first 10 items only to keep runtime low)
+                summary = generate_summary(item["link"]) if idx < 10 else ""
                 is_exam = any(kw in title.lower() for kw in EXAM_KEYWORDS)
                 prefix = "⭐ <b>EXAM-RELEVANT</b>\n" if is_exam else ""
-                entities = extract_entities(desc) if desc else []
+                entities = extract_entities(summary) if summary else []
                 affected = f"\n🎯 <b>Affected:</b> {', '.join(entities)}" if entities else ""
                 date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "?"
                 msg = (
@@ -245,7 +231,7 @@ def main():
                     f"<b>{title}</b>"
                 )
                 if summary:
-                    msg += f"\n<i>{summary}</i>"
+                    msg += f"\n📌 <i>{summary}</i>"
                 msg += f"{affected}\n<a href='{item['link']}'>📄 Read full update</a>"
                 send(msg)
             except Exception as e:
@@ -253,17 +239,12 @@ def main():
                 traceback.print_exc()
         print(f"✅ Sent {len(new_items)} new items.")
     else:
-        # Monthly roundup (include items even if no date)
+        # Monthly roundup (with summaries)
         cutoff = datetime.now() - timedelta(days=30)
         monthly = []
         for it in items:
-            if it["pub_date"] is None:
-                # No date? Assume it's recent (top of the listing)
+            if it["pub_date"] is None or it["pub_date"] >= cutoff:
                 monthly.append(it)
-            elif it["pub_date"] >= cutoff:
-                monthly.append(it)
-
-        # Deduplicate
         unique = {}
         for it in monthly:
             if it["link"] not in unique:
@@ -288,18 +269,17 @@ def main():
                 lines.append(f"{cat}: {cnt} item(s)")
             lines.append("")
             lines.append("━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("🔹 <b>Recent highlights:</b>")
+            lines.append("🔹 <b>Recent highlights (AI summary):</b>")
             for item in monthly[:10]:
                 try:
                     date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "?"
-                    desc = fetch_summary_from_url(item["link"])
-                    summary = clean_summary(desc, item["title"])
-                    entities = extract_entities(desc) if desc else []
+                    summary = generate_summary(item["link"])
+                    entities = extract_entities(summary) if summary else []
                     affected = f" | Affected: {', '.join(entities)}" if entities else ""
                     lines.append(
                         f"• {item['category']} ({date_str})\n"
                         f"  <b>{item['title']}</b>\n"
-                        f"  <i>{summary}</i>{affected}\n"
+                        f"  📌 <i>{summary}</i>{affected}\n"
                         f"  <a href='{item['link']}'>📄 Read more</a>"
                     )
                 except Exception as e:
