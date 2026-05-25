@@ -63,8 +63,19 @@ def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
         json.dump(seen, f, indent=2)
 
+def extract_date(text):
+    """
+    Try to find a date anywhere in a cell using common patterns.
+    Returns a datetime object or None.
+    """
+    # Look for pattern like 'May 25, 2026' or '25 May 2026'
+    match = re.search(r'(\d{1,2}\s+\w+\s+\d{4})', text)
+    if match:
+        return parse_date(match.group(1))
+    return None
+
 def parse_date(text):
-    """Parse RBI date format like 'May 24, 2026' or '24 May 2026'."""
+    """Parse a clean date string."""
     text = text.strip().replace(",", "")
     formats = ["%B %d %Y", "%d %B %Y", "%b %d %Y", "%d %b %Y"]
     for fmt in formats:
@@ -80,13 +91,18 @@ def is_exam_relevant(title):
     return any(kw in title_lower for kw in EXAM_KEYWORDS)
 
 def _clean_summary(text):
-    """Remove the RBI metadata line like 'Press Releases ( 472 kb ) Date : May 25, 2026'."""
-    cleaned = re.sub(
-        r"^(Press Releases?|Circulars?|Notifications?|What's New)\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s+\d{4}\s*",
-        "",
-        text
-    ).strip()
-    # Return first 300 chars
+    """
+    Remove the RBI metadata line that looks like:
+    'Press Releases ( 472 kb ) Date : May 25, 2026'
+    Also removes any leading/trailing whitespace.
+    """
+    # Strip leading/trailing spaces/newlines
+    text = text.strip()
+    # Pattern: file type, size, and date line at the very start
+    # It may contain extra spaces, so use \s+ generously.
+    pattern = r'^[A-Za-z\s]+\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s+\d{4}\s*'
+    cleaned = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
+    # If nothing left (unlikely), return the original trimmed text
     return cleaned[:300] + ("…" if len(cleaned) > 300 else "")
 
 def fetch_summary(url):
@@ -169,8 +185,9 @@ def scrape_with_dates(source):
             cells = row.find_all("td")
             if len(cells) < 2:
                 continue
-            date_cell = cells[0].get_text(strip=True)
-            dt = parse_date(date_cell)
+            # Use the new extract_date on the entire cell text
+            date_cell = cells[0].get_text(" ", strip=True)
+            dt = extract_date(date_cell)
             a_tag = row.find("a", href=True)
             if not a_tag:
                 continue
@@ -181,7 +198,6 @@ def scrape_with_dates(source):
             if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
                 continue
 
-            # Properly resolve relative URLs using the listing page as base
             abs_url = urljoin(source["url"], href)
 
             items.append({
@@ -241,9 +257,8 @@ def send(text):
     except Exception as e:
         print(f"  ⚠️  Telegram error: {e}")
 
-# ─── Monthly summary builder (with clean summaries) ──────
+# ─── Monthly summary builder ─────────────────────────────
 def get_monthly_summary():
-    """Fetch items from all sources, keep those within last 30 days, return formatted summary."""
     cutoff = datetime.now() - timedelta(days=30)
     all_items = []
 
@@ -253,7 +268,6 @@ def get_monthly_summary():
             if item["date"] is None or item["date"] >= cutoff:
                 all_items.append({**item, "tag": source["tag"], "label": source["label"]})
 
-    # Deduplicate by URL
     seen_urls = set()
     unique = []
     for item in all_items:
@@ -261,7 +275,6 @@ def get_monthly_summary():
             seen_urls.add(item["url"])
             unique.append(item)
 
-    # Sort by date descending, items with None date go last
     unique.sort(key=lambda x: (x["date"] is not None, x["date"] or datetime.min), reverse=True)
 
     if not unique:
@@ -272,10 +285,11 @@ def get_monthly_summary():
         counts[item["label"]] = counts.get(item["label"], 0) + 1
 
     today = datetime.now().strftime("%d %b %Y")
+    cutoff_str = cutoff.strftime("%d %b")
     lines = [
         f"📊 <b>RBI Monthly Roundup (last 30 days)</b>",
         f"━━━━━━━━━━━━━━━━━━━━━",
-        f"📆 Period: {cutoff.strftime('%d %b')} – {today}",
+        f"📆 Period: {cutoff_str} – {today}",
         f"📌 Total updates: {len(unique)}",
         "",
     ]
@@ -283,7 +297,7 @@ def get_monthly_summary():
         lines.append(f"{label}: {count} item(s)")
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("🔹 <b>Recent highlights (with summaries):</b>")
+    lines.append("🔹 <b>Recent highlights:</b>")
 
     for item in unique[:10]:
         date_str = item["date"].strftime("%d %b") if item["date"] else "?"
@@ -291,7 +305,6 @@ def get_monthly_summary():
         summary = fetch_summary(item["url"])
         block = f"• {item['label']} ({date_str})\n  <b>{title_short}</b>"
         if summary:
-            # summary already trimmed and cleaned by fetch_summary
             block += f"\n  <i>{summary[:250]}</i>"
         block += f"\n  <a href='{item['url']}'>📄 Read full update</a>"
         lines.append(block)
@@ -343,7 +356,7 @@ def main():
             title = item["title"][:200]
             prefix = "⭐ EXAM-RELEVANT: " if item["exam"] else ""
             summary = ""
-            if i < 10:   # only fetch summary for first 10 to stay within time
+            if i < 10:
                 summary = fetch_summary(item["url"])
                 time.sleep(0.5)
 
