@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import re
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
@@ -78,11 +79,20 @@ def is_exam_relevant(title):
     title_lower = title.lower()
     return any(kw in title_lower for kw in EXAM_KEYWORDS)
 
+def _clean_summary(text):
+    """Remove the RBI metadata line like 'Press Releases ( 472 kb ) Date : May 25, 2026'."""
+    cleaned = re.sub(
+        r"^(Press Releases?|Circulars?|Notifications?|What's New)\s*\(\s*\d+\s*kb\s*\)\s*Date\s*:\s*\d{1,2}\s+\w+\s+\d{4}\s*",
+        "",
+        text
+    ).strip()
+    # Return first 300 chars
+    return cleaned[:300] + ("…" if len(cleaned) > 300 else "")
+
 def fetch_summary(url):
     """
     Scrape the detail page and return the first 300 characters of the
-    main article text, without the RBI site navigation header.
-    Returns empty string if the page is an error page or inaccessible.
+    main article text, without the RBI navigation header or metadata line.
     """
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
@@ -92,13 +102,13 @@ def fetch_summary(url):
         # Check if we landed on an error page
         page_text = soup.get_text()
         if "sorry for your inconvenience" in page_text.lower():
-            return ""   # invalid article URL
+            return ""
 
-        # Remove clearly irrelevant elements
+        # Remove irrelevant elements
         for tag in soup(["script", "style", "nav", "header", "footer", "noscript"]):
             tag.decompose()
 
-        # Strategy 1: Try common content containers
+        # Strategy 1: Common content containers
         content = soup.select_one(
             "#content, .content, .main-content, .entry-content, .pressrelease, "
             "article, [role='main'], .page-content, .post-content"
@@ -107,18 +117,18 @@ def fetch_summary(url):
             text = content.get_text(separator=" ", strip=True)
             text = " ".join(text.split())
             if len(text) > 150:
-                return text[:300] + ("…" if len(text) > 300 else "")
+                return _clean_summary(text)
 
-        # Strategy 2: Find the column with the most text (Bootstrap layout)
+        # Strategy 2: Column with most text
         cols = soup.select('div[class*="col-"]')
         if cols:
             best = max(cols, key=lambda c: len(c.get_text()))
             text = best.get_text(separator=" ", strip=True)
             text = " ".join(text.split())
             if len(text) > 150:
-                return text[:300] + ("…" if len(text) > 300 else "")
+                return _clean_summary(text)
 
-        # Strategy 3: Fallback – filter out RBI navigation boilerplate
+        # Strategy 3: Fallback body text filtering
         body_text = soup.body.get_text(separator="\n") if soup.body else ""
         lines = [line.strip() for line in body_text.splitlines() if line.strip()]
         skip_keywords = [
@@ -140,7 +150,7 @@ def fetch_summary(url):
         cleaned_text = " ".join(clean_lines)
         cleaned_text = " ".join(cleaned_text.split())
         if cleaned_text:
-            return cleaned_text[:300] + ("…" if len(cleaned_text) > 300 else "")
+            return _clean_summary(cleaned_text)
 
         return ""
 
@@ -171,7 +181,7 @@ def scrape_with_dates(source):
             if any(skip in href.lower() for skip in ["javascript", "mailto", "#", "home", "sitemap"]):
                 continue
 
-            # ✅ Fix: properly resolve relative URLs using the listing page as base
+            # Properly resolve relative URLs using the listing page as base
             abs_url = urljoin(source["url"], href)
 
             items.append({
@@ -231,7 +241,7 @@ def send(text):
     except Exception as e:
         print(f"  ⚠️  Telegram error: {e}")
 
-# ─── Monthly summary builder (with summaries) ────────────
+# ─── Monthly summary builder (with clean summaries) ──────
 def get_monthly_summary():
     """Fetch items from all sources, keep those within last 30 days, return formatted summary."""
     cutoff = datetime.now() - timedelta(days=30)
@@ -243,6 +253,7 @@ def get_monthly_summary():
             if item["date"] is None or item["date"] >= cutoff:
                 all_items.append({**item, "tag": source["tag"], "label": source["label"]})
 
+    # Deduplicate by URL
     seen_urls = set()
     unique = []
     for item in all_items:
@@ -250,6 +261,7 @@ def get_monthly_summary():
             seen_urls.add(item["url"])
             unique.append(item)
 
+    # Sort by date descending, items with None date go last
     unique.sort(key=lambda x: (x["date"] is not None, x["date"] or datetime.min), reverse=True)
 
     if not unique:
@@ -279,8 +291,8 @@ def get_monthly_summary():
         summary = fetch_summary(item["url"])
         block = f"• {item['label']} ({date_str})\n  <b>{title_short}</b>"
         if summary:
-            summary_short = summary[:250]
-            block += f"\n  <i>{summary_short}</i>"
+            # summary already trimmed and cleaned by fetch_summary
+            block += f"\n  <i>{summary[:250]}</i>"
         block += f"\n  <a href='{item['url']}'>📄 Read full update</a>"
         lines.append(block)
 
@@ -331,7 +343,7 @@ def main():
             title = item["title"][:200]
             prefix = "⭐ EXAM-RELEVANT: " if item["exam"] else ""
             summary = ""
-            if i < 10:
+            if i < 10:   # only fetch summary for first 10 to stay within time
                 summary = fetch_summary(item["url"])
                 time.sleep(0.5)
 
