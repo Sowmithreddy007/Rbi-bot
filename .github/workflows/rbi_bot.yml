@@ -2,17 +2,12 @@ name: RBI Notification Bot
 
 on:
   schedule:
-    # 8:00 AM IST = 2:30 AM UTC  (IST = UTC+5:30)
-    - cron: '30 2 * * *'
-
-  # Lets you run it manually from GitHub Actions tab
+    - cron: '30 2 * * *'   # 8:00 AM IST
   workflow_dispatch:
 
 jobs:
   fetch-and-notify:
     runs-on: ubuntu-latest
-
-    # Give the workflow write access to commit seen.json back
     permissions:
       contents: write
 
@@ -44,6 +39,5 @@ jobs:
           git config user.name  "rbi-bot[bot]"
           git config user.email "rbi-bot@users.noreply.github.com"
           git add seen.json
-          # Only commit if seen.json actually changed
           git diff --staged --quiet || git commit -m "chore: update seen notifications [skip ci]"
           git push
