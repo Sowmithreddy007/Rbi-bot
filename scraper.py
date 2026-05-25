@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import re
 import requests
 from datetime import datetime, timedelta
@@ -10,7 +9,8 @@ from bs4 import BeautifulSoup
 TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SEEN_FILE = "seen.json"
-RSS_URL  = "https://www.rbi.org.in/rss.xml"
+# ✅ Correct RSS feed URL
+RSS_URL  = "https://www.rbi.org.in/Scripts/BS_RSSFeed.aspx"
 HEADERS  = {"User-Agent": "Mozilla/5.0 (compatible; RBI-Bot/1.0)"}
 
 # ─── Exam priority keywords ──────────────────────────────
@@ -140,7 +140,6 @@ def fetch_rss():
 def send(text):
     """Send a Telegram message, splitting if needed."""
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    # Telegram max length 4096, but keep it shorter for readability
     MAX_LEN = 4000
     if len(text) > MAX_LEN:
         text = text[:MAX_LEN-3] + "…"
@@ -186,21 +185,15 @@ def main():
         )
         for item in new_items:
             title = item["title"]
-            # Clean description: remove title if repeated, limit to 300 chars
             desc = item["description"]
             if desc.startswith(title):
                 desc = desc[len(title):].strip()
-            # Build a crisp summary (first 250 chars)
             summary = desc[:250] + ("…" if len(desc) > 250 else "")
-            # Exam relevance
             is_exam = any(kw in title.lower() for kw in EXAM_KEYWORDS)
             prefix = "⭐ <b>EXAM-RELEVANT</b>\n" if is_exam else ""
-            # Entities affected
             entities = extract_entities(desc)
             affected = f"\n🎯 <b>Affected:</b> {', '.join(entities)}" if entities else ""
-            # Date string
             date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "?"
-            # Final message
             msg = (
                 f"{item['category']} ({date_str})\n"
                 f"{prefix}"
@@ -228,7 +221,6 @@ def main():
             save_seen(seen)
             return
 
-        # Count categories
         counts = {}
         for it in monthly:
             counts[it["category"]] = counts.get(it["category"], 0) + 1
@@ -244,7 +236,6 @@ def main():
         lines.append("")
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
         lines.append("🔹 <b>Recent highlights:</b>")
-        # Show top 10
         for item in monthly[:10]:
             date_str = item["pub_date"].strftime("%d %b") if item["pub_date"] else "?"
             desc = item["description"]
