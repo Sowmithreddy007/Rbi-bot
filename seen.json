@@ -947,7 +947,15 @@
     "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63732",
     "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63731",
     "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63730",
-    "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63729"
+    "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63729",
+    "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63745",
+    "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63744",
+    "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63743",
+    "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63742",
+    "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63741",
+    "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63740",
+    "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63739",
+    "https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=63738"
   ],
   "circular": [
     "https://www.rbi.org.in/Scripts/BS_CircularIndexDisplay.aspx?Id=13462",
@@ -1149,7 +1157,9 @@
     "https://www.rbi.org.in/Scripts/BS_CircularIndexDisplay.aspx?Id=13722",
     "https://www.rbi.org.in/Scripts/BS_CircularIndexDisplay.aspx?Id=13721",
     "https://www.rbi.org.in/Scripts/BS_CircularIndexDisplay.aspx?Id=13720",
-    "https://www.rbi.org.in/Scripts/BS_CircularIndexDisplay.aspx?Id=13719"
+    "https://www.rbi.org.in/Scripts/BS_CircularIndexDisplay.aspx?Id=13719",
+    "https://www.rbi.org.in/Scripts/BS_CircularIndexDisplay.aspx?Id=13727",
+    "https://www.rbi.org.in/Scripts/BS_CircularIndexDisplay.aspx?Id=13726"
   ],
   "notification": [],
   "whatsnew": []
